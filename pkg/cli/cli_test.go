@@ -14,11 +14,12 @@ func TestRootCommand(t *testing.T) {
 
 	// Check all subcommands exist
 	expected := map[string]bool{
-		"create":  false,
-		"delete":  false,
-		"list":    false,
-		"connect": false,
-		"logs":    false,
+		"create":   false,
+		"delete":   false,
+		"list":     false,
+		"connect":  false,
+		"logs":     false,
+		"operator": false,
 	}
 
 	for _, sub := range cmd.Commands() {
@@ -184,5 +185,46 @@ func TestLogsCommand_RequiresName(t *testing.T) {
 	err := cmd.Execute()
 	if err == nil {
 		t.Error("logs without name should fail")
+	}
+}
+
+func TestOperatorCommand_Structure(t *testing.T) {
+	cmd := NewRootCommand()
+	operatorCmd, _, err := cmd.Find([]string{"operator"})
+	if err != nil {
+		t.Fatalf("operator command not found: %v", err)
+	}
+
+	expected := map[string]bool{
+		"install":   false,
+		"uninstall": false,
+	}
+
+	for _, sub := range operatorCmd.Commands() {
+		if _, ok := expected[sub.Name()]; ok {
+			expected[sub.Name()] = true
+		}
+	}
+
+	for name, found := range expected {
+		if !found {
+			t.Errorf("missing subcommand %q in operator", name)
+		}
+	}
+}
+
+func TestOperatorInstallCommand_Flags(t *testing.T) {
+	cmd := NewRootCommand()
+	installCmd, _, err := cmd.Find([]string{"operator", "install"})
+	if err != nil {
+		t.Fatalf("operator install command not found: %v", err)
+	}
+
+	flag := installCmd.Flags().Lookup("image")
+	if flag == nil {
+		t.Fatal("flag --image not found")
+	}
+	if flag.DefValue != "" {
+		t.Errorf("image default = %q, want empty", flag.DefValue)
 	}
 }

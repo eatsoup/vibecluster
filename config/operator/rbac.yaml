@@ -1,0 +1,77 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vibecluster-operator
+  labels:
+    app.kubernetes.io/name: vibecluster-operator
+    app.kubernetes.io/component: operator
+rules:
+  # VirtualCluster CRD management
+  - apiGroups: ["vibecluster.dev"]
+    resources: ["virtualclusters"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["vibecluster.dev"]
+    resources: ["virtualclusters/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["vibecluster.dev"]
+    resources: ["virtualclusters/finalizers"]
+    verbs: ["update"]
+
+  # Namespace management
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+
+  # Service account management
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+
+  # Service management
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+
+  # Secret management (for kubeconfig secrets)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+
+  # StatefulSet management
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+
+  # RBAC management (operator creates roles for vcluster syncers)
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+
+  # Events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+  # Leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vibecluster-operator
+  labels:
+    app.kubernetes.io/name: vibecluster-operator
+    app.kubernetes.io/component: operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vibecluster-operator
+subjects:
+  - kind: ServiceAccount
+    name: vibecluster-operator
+    namespace: vibecluster-system

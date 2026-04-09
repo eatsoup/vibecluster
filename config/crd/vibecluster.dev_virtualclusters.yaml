@@ -1,0 +1,90 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: virtualclusters.vibecluster.dev
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.14.0
+spec:
+  group: vibecluster.dev
+  names:
+    kind: VirtualCluster
+    listKind: VirtualClusterList
+    plural: virtualclusters
+    singular: virtualcluster
+    shortNames:
+      - vc
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Ready
+          type: boolean
+          jsonPath: .status.ready
+        - name: Namespace
+          type: string
+          jsonPath: .status.namespace
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          description: VirtualCluster is a lightweight virtual Kubernetes cluster running inside the host cluster.
+          type: object
+          properties:
+            apiVersion:
+              description: 'APIVersion defines the versioned schema of this representation of an object.'
+              type: string
+            kind:
+              description: 'Kind is a string value representing the REST resource this object represents.'
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: VirtualClusterSpec defines the desired state of a VirtualCluster.
+              type: object
+              properties:
+                k3sImage:
+                  description: K3sImage is the k3s container image to use.
+                  type: string
+                  default: "rancher/k3s:v1.28.5-k3s1"
+                syncerImage:
+                  description: SyncerImage is the syncer container image to use.
+                  type: string
+                  default: "ghcr.io/eatsoup/vibecluster/syncer:latest"
+                storage:
+                  description: Storage is the size of the persistent volume for k3s data.
+                  type: string
+                  default: "5Gi"
+                  pattern: "^[0-9]+(Ki|Mi|Gi|Ti|Pi|Ei)?$"
+            status:
+              description: VirtualClusterStatus defines the observed state of a VirtualCluster.
+              type: object
+              properties:
+                phase:
+                  description: Phase is the current lifecycle phase of the virtual cluster.
+                  type: string
+                  enum:
+                    - Pending
+                    - Running
+                    - Failed
+                    - Deleting
+                ready:
+                  description: Ready indicates whether the virtual cluster is fully operational.
+                  type: boolean
+                message:
+                  description: Message provides human-readable information about the current state.
+                  type: string
+                namespace:
+                  description: Namespace is the host namespace where the virtual cluster resources are deployed.
+                  type: string
+                observedGeneration:
+                  description: ObservedGeneration is the most recent generation observed by the controller.
+                  type: integer
+                  format: int64

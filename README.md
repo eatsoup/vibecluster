@@ -165,6 +165,117 @@ Synced resources on the host are labeled with:
 | `--print` | `false` | Print kubeconfig to stdout |
 | `--kubeconfig` | `~/.kube/config` | Kubeconfig output file |
 
+## Operator / GitOps
+
+vibecluster can be deployed as a **Kubernetes operator**, enabling GitOps workflows where virtual clusters are managed declaratively via `VirtualCluster` custom resources. This integrates seamlessly with tools like [ArgoCD](https://argo-cd.readthedocs.io/) and [Flux](https://fluxcd.io/).
+
+### Deploying the operator
+
+You can easily install the operator and CRDs directly using the CLI:
+
+```bash
+vibecluster operator install
+```
+
+This command will automatically create the CRD, namespace, service accounts, RBAC, and deploy the operator container.
+
+To remove the operator and its custom resources:
+
+```bash
+vibecluster operator uninstall
+```
+
+Alternatively, you can manually install the manifests using standard `kubectl` commands:
+
+```bash
+# Using kustomize (includes CRD + RBAC + Deployment)
+kubectl apply -k https://github.com/eatsoup/vibecluster/config/operator
+
+# Or manually
+kubectl apply -f config/crd/vibecluster.dev_virtualclusters.yaml
+kubectl apply -f config/operator/rbac.yaml
+kubectl apply -f config/operator/deployment.yaml
+```
+
+### Create a VirtualCluster
+
+```yaml
+apiVersion: vibecluster.dev/v1alpha1
+kind: VirtualCluster
+metadata:
+  name: dev-cluster
+  namespace: default
+spec:
+  # All optional — sensible defaults applied
+  k3sImage: "rancher/k3s:v1.28.5-k3s1"
+  syncerImage: "ghcr.io/eatsoup/vibecluster/syncer:latest"
+  storage: "5Gi"
+```
+
+```bash
+kubectl apply -f my-cluster.yaml
+```
+
+### Check status
+
+```bash
+kubectl get virtualclusters
+```
+
+```
+NAME          PHASE     READY   NAMESPACE         AGE
+dev-cluster   Running   true    vc-dev-cluster    5m
+```
+
+### VirtualCluster spec fields
+
+| Field | Default | Description |
+|---|---|---|
+| `k3sImage` | `rancher/k3s:v1.28.5-k3s1` | k3s container image |
+| `syncerImage` | `ghcr.io/eatsoup/vibecluster/syncer:latest` | Syncer sidecar image |
+| `storage` | `5Gi` | Persistent volume size for k3s data |
+
+### VirtualCluster status fields
+
+| Field | Description |
+|---|---|
+| `phase` | `Pending`, `Running`, `Failed`, or `Deleting` |
+| `ready` | `true` when StatefulSet has ready replicas |
+| `message` | Human-readable status message |
+| `namespace` | Host namespace (e.g., `vc-dev-cluster`) |
+| `observedGeneration` | Last reconciled generation |
+
+### Delete a VirtualCluster
+
+```bash
+kubectl delete virtualcluster dev-cluster
+```
+
+The operator will clean up the namespace, RBAC, and all associated resources.
+
+### ArgoCD / Flux integration
+
+Store your `VirtualCluster` manifests in a Git repository and point your GitOps tool at them:
+
+```yaml
+# argocd-app.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: virtual-clusters
+spec:
+  source:
+    repoURL: https://github.com/your-org/cluster-configs
+    path: virtual-clusters
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
 ## Development
 
 ```bash
@@ -177,6 +288,24 @@ make syncer-image
 # Push syncer image
 make syncer-push
 
+# Build operator
+make build-operator
+
+# Build operator image
+make operator-image
+
+# Push operator image
+make operator-push
+
+# Install CRD
+make install-crd
+
+# Deploy operator (CRD + RBAC + Deployment)
+make deploy-operator
+
+# Undeploy operator
+make undeploy-operator
+
 # Run tests
 make test
 ```
@@ -184,3 +313,4 @@ make test
 ## License
 
 [MIT](LICENSE)
+
