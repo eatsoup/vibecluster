@@ -169,13 +169,23 @@ Synced resources on the host are labeled with:
 
 vibecluster can be deployed as a **Kubernetes operator**, enabling GitOps workflows where virtual clusters are managed declaratively via `VirtualCluster` custom resources. This integrates seamlessly with tools like [ArgoCD](https://argo-cd.readthedocs.io/) and [Flux](https://fluxcd.io/).
 
-### Install the CRD
+### Deploying the operator
+
+You can easily install the operator and CRDs directly using the CLI:
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/eatsoup/vibecluster/main/config/crd/vibecluster.dev_virtualclusters.yaml
+vibecluster operator install
 ```
 
-### Deploy the operator
+This command will automatically create the CRD, namespace, service accounts, RBAC, and deploy the operator container.
+
+To remove the operator and its custom resources:
+
+```bash
+vibecluster operator uninstall
+```
+
+Alternatively, you can manually install the manifests using standard `kubectl` commands:
 
 ```bash
 # Using kustomize (includes CRD + RBAC + Deployment)
