@@ -87,7 +87,7 @@ func TestLogsCommand_Flags(t *testing.T) {
 
 	followFlag := logs.Flags().Lookup("follow")
 	if followFlag == nil {
-		t.Error("flag --follow not found")
+		t.Fatal("flag --follow not found")
 	}
 	if followFlag.Shorthand != "f" {
 		t.Errorf("follow shorthand = %q, want f", followFlag.Shorthand)
@@ -95,7 +95,7 @@ func TestLogsCommand_Flags(t *testing.T) {
 
 	containerFlag := logs.Flags().Lookup("container")
 	if containerFlag == nil {
-		t.Error("flag --container not found")
+		t.Fatal("flag --container not found")
 	}
 	if containerFlag.DefValue != "syncer" {
 		t.Errorf("container default = %q, want syncer", containerFlag.DefValue)
