@@ -41,8 +41,6 @@ func runConnect(name string, opts *connectOptions) error {
 	}
 
 	ctx := cmd_context()
-	log := fmt.Fprintf // use stderr for status when printing kubeconfig to stdout
-	logW := os.Stderr
 
 	// Check the cluster exists and is ready
 	if err := k8s.WaitForReady(ctx, client, name, 30e9); err != nil {
@@ -57,17 +55,17 @@ func runConnect(name string, opts *connectOptions) error {
 		ns := k8s.NamespaceName(name)
 		podName := name + "-0"
 
-		log(logW, "Setting up port-forward to %s/%s...\n", ns, podName)
+		fmt.Fprintf(os.Stderr, "Setting up port-forward to %s/%s...\n", ns, podName)
 		localPort, stop, err := k8s.PortForward(ctx, client, restConfig, ns, podName, k8s.K3sPort)
 		if err != nil {
 			return fmt.Errorf("port-forward: %w", err)
 		}
 		stopCh = stop
 		server = fmt.Sprintf("https://127.0.0.1:%d", localPort)
-		log(logW, "Port-forward established on port %d\n", localPort)
+		fmt.Fprintf(os.Stderr, "Port-forward established on port %d\n", localPort)
 	}
 
-	log(logW, "Retrieving kubeconfig for %q...\n", name)
+	fmt.Fprintf(os.Stderr, "Retrieving kubeconfig for %q...\n", name)
 	config, err := kubeconfig.Retrieve(ctx, client, restConfig, name, server)
 	if err != nil {
 		if stopCh != nil {
@@ -91,11 +89,11 @@ func runConnect(name string, opts *connectOptions) error {
 	}
 
 	contextName := "vibecluster-" + name
-	log(logW, "Kubeconfig written. Current context set to %q\n", contextName)
+	fmt.Fprintf(os.Stderr, "Kubeconfig written. Current context set to %q\n", contextName)
 
 	if stopCh != nil {
-		log(logW, "Port-forward running in background. Press Ctrl+C to stop.\n")
-		log(logW, "\nTo use: kubectl get nodes\n")
+		fmt.Fprintf(os.Stderr, "Port-forward running in background. Press Ctrl+C to stop.\n")
+		fmt.Fprintf(os.Stderr, "\nTo use: kubectl get nodes\n")
 		<-ctx.Done()
 		close(stopCh)
 	}
