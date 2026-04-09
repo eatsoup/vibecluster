@@ -23,7 +23,7 @@ type CreateOptions struct {
 }
 
 // CreateVirtualCluster deploys all resources for a virtual cluster.
-func CreateVirtualCluster(ctx context.Context, client *kubernetes.Clientset, name string, opts CreateOptions) error {
+func CreateVirtualCluster(ctx context.Context, client kubernetes.Interface, name string, opts CreateOptions) error {
 	ns := NamespaceName(name)
 	labels := Labels(name)
 	annotations := map[string]string{
@@ -77,7 +77,7 @@ func CreateVirtualCluster(ctx context.Context, client *kubernetes.Clientset, nam
 }
 
 // DeleteVirtualCluster removes all resources for a virtual cluster.
-func DeleteVirtualCluster(ctx context.Context, client *kubernetes.Clientset, name string) error {
+func DeleteVirtualCluster(ctx context.Context, client kubernetes.Interface, name string) error {
 	ns := NamespaceName(name)
 
 	// Delete cluster-scoped RBAC first
@@ -94,7 +94,7 @@ func DeleteVirtualCluster(ctx context.Context, client *kubernetes.Clientset, nam
 	return nil
 }
 
-func createNamespace(ctx context.Context, client *kubernetes.Clientset, ns string, labels, annotations map[string]string) error {
+func createNamespace(ctx context.Context, client kubernetes.Interface, ns string, labels, annotations map[string]string) error {
 	_, err := client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        ns,
@@ -108,7 +108,7 @@ func createNamespace(ctx context.Context, client *kubernetes.Clientset, ns strin
 	return err
 }
 
-func copySecret(ctx context.Context, client *kubernetes.Clientset, name, srcNS, dstNS string) error {
+func copySecret(ctx context.Context, client kubernetes.Interface, name, srcNS, dstNS string) error {
 	secret, err := client.CoreV1().Secrets(srcNS).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("getting secret %s/%s: %w", srcNS, name, err)
@@ -130,7 +130,7 @@ func copySecret(ctx context.Context, client *kubernetes.Clientset, name, srcNS, 
 	return err
 }
 
-func createServiceAccount(ctx context.Context, client *kubernetes.Clientset, name, ns string, labels map[string]string, imagePullSecret string) error {
+func createServiceAccount(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, imagePullSecret string) error {
 	sa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "vc-" + name,
@@ -146,7 +146,7 @@ func createServiceAccount(ctx context.Context, client *kubernetes.Clientset, nam
 	return err
 }
 
-func createRBAC(ctx context.Context, client *kubernetes.Clientset, name, ns string, labels map[string]string) error {
+func createRBAC(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string) error {
 	clusterRoleName := fmt.Sprintf("vc-%s-%s", name, ns)
 
 	// ClusterRole - permissions needed by the syncer to operate on host cluster
@@ -264,7 +264,7 @@ func createRBAC(ctx context.Context, client *kubernetes.Clientset, name, ns stri
 	return err
 }
 
-func createServices(ctx context.Context, client *kubernetes.Clientset, name, ns string, labels map[string]string) error {
+func createServices(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string) error {
 	// Main service (ClusterIP)
 	_, err := client.CoreV1().Services(ns).Create(ctx, &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -311,7 +311,7 @@ func createServices(ctx context.Context, client *kubernetes.Clientset, name, ns 
 	return err
 }
 
-func createStatefulSet(ctx context.Context, client *kubernetes.Clientset, name, ns string, labels map[string]string, syncerImage, imagePullSecret string) error {
+func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, syncerImage, imagePullSecret string) error {
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   name,
@@ -465,7 +465,7 @@ type VClusterInfo struct {
 	Created   string
 }
 
-func ListVirtualClusters(ctx context.Context, client *kubernetes.Clientset) ([]VClusterInfo, error) {
+func ListVirtualClusters(ctx context.Context, client kubernetes.Interface) ([]VClusterInfo, error) {
 	namespaces, err := client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{
 		LabelSelector: LabelManagedBy + "=" + LabelManagedByValue,
 	})
@@ -504,7 +504,7 @@ func ListVirtualClusters(ctx context.Context, client *kubernetes.Clientset) ([]V
 }
 
 // WaitForReady waits until the virtual cluster pod is ready.
-func WaitForReady(ctx context.Context, client *kubernetes.Clientset, name string, timeout time.Duration) error {
+func WaitForReady(ctx context.Context, client kubernetes.Interface, name string, timeout time.Duration) error {
 	ns := NamespaceName(name)
 	deadline := time.Now().Add(timeout)
 

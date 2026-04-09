@@ -27,13 +27,13 @@ const (
 // Syncer syncs resources between a virtual cluster and the host cluster.
 type Syncer struct {
 	name       string
-	hostClient *kubernetes.Clientset
-	vClient    *kubernetes.Clientset
+	hostClient kubernetes.Interface
+	vClient    kubernetes.Interface
 	hostNS     string
 }
 
 // New creates a new Syncer.
-func New(name string, hostClient, vClient *kubernetes.Clientset) *Syncer {
+func New(name string, hostClient, vClient kubernetes.Interface) *Syncer {
 	return &Syncer{
 		name:       name,
 		hostClient: hostClient,

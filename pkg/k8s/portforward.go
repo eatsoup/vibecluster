@@ -15,7 +15,7 @@ import (
 
 // PortForward sets up port forwarding to a pod and returns the local port.
 // Close stopCh to stop forwarding.
-func PortForward(ctx context.Context, client *kubernetes.Clientset, restConfig *rest.Config, namespace, podName string, remotePort int) (int, chan struct{}, error) {
+func PortForward(ctx context.Context, client kubernetes.Interface, restConfig *rest.Config, namespace, podName string, remotePort int) (int, chan struct{}, error) {
 	// Find a free local port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
