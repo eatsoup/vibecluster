@@ -1,0 +1,14 @@
+# Example VirtualCluster resource for GitOps usage.
+# Apply with: kubectl apply -f examples/virtualcluster.yaml
+apiVersion: vibecluster.dev/v1alpha1
+kind: VirtualCluster
+metadata:
+  name: dev-cluster
+  namespace: default
+spec:
+  # All fields are optional — sensible defaults are applied.
+  # Uncomment and modify as needed:
+
+  # k3sImage: "rancher/k3s:v1.28.5-k3s1"
+  # syncerImage: "ghcr.io/eatsoup/vibecluster/syncer:latest"
+  # storage: "5Gi"
