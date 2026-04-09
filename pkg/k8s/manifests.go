@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -18,8 +19,11 @@ import (
 
 // CreateOptions holds options for virtual cluster creation.
 type CreateOptions struct {
-	SyncerImage     string
-	ImagePullSecret string // name of dockerconfigjson secret in default namespace to copy
+	SyncerImage        string
+	ImagePullSecret    string // name of dockerconfigjson secret in default namespace to copy
+	ExposeType         string
+	ExposeIngressClass string
+	ExposeHost         string
 }
 
 // CreateVirtualCluster deploys all resources for a virtual cluster.
@@ -63,13 +67,13 @@ func CreateVirtualCluster(ctx context.Context, client kubernetes.Interface, name
 
 	// 5. Create services
 	fmt.Printf("  Creating services...\n")
-	if err := createServices(ctx, client, name, ns, labels); err != nil {
+	if err := createServices(ctx, client, name, ns, labels, opts.ExposeType, opts.ExposeHost, opts.ExposeIngressClass); err != nil {
 		return fmt.Errorf("creating services: %w", err)
 	}
 
 	// 6. Create statefulset
 	fmt.Printf("  Creating StatefulSet...\n")
-	if err := createStatefulSet(ctx, client, name, ns, labels, syncerImage, opts.ImagePullSecret); err != nil {
+	if err := createStatefulSet(ctx, client, name, ns, labels, syncerImage, opts.ImagePullSecret, opts.ExposeHost); err != nil {
 		return fmt.Errorf("creating statefulset: %w", err)
 	}
 
@@ -264,15 +268,20 @@ func createRBAC(ctx context.Context, client kubernetes.Interface, name, ns strin
 	return err
 }
 
-func createServices(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string) error {
-	// Main service (ClusterIP)
+func createServices(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, exposeType, exposeHost, exposeIngressClass string) error {
+	svcType := corev1.ServiceTypeClusterIP
+	if exposeType == "LoadBalancer" {
+		svcType = corev1.ServiceTypeLoadBalancer
+	}
+
+	// Main service
 	_, err := client.CoreV1().Services(ns).Create(ctx, &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   name,
 			Labels: labels,
 		},
 		Spec: corev1.ServiceSpec{
-			Type:     corev1.ServiceTypeClusterIP,
+			Type:     svcType,
 			Selector: labels,
 			Ports: []corev1.ServicePort{
 				{
@@ -308,10 +317,42 @@ func createServices(ctx context.Context, client kubernetes.Interface, name, ns s
 			},
 		},
 	}, metav1.CreateOptions{})
-	return err
+	if err != nil {
+		return err
+	}
+
+	if exposeType == "Ingress" {
+		ing := BuildIngress(name, ns, labels, exposeHost, exposeIngressClass)
+		if ing != nil {
+			_, err = client.NetworkingV1().Ingresses(ns).Create(ctx, ing, metav1.CreateOptions{})
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
-func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, syncerImage, imagePullSecret string) error {
+func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, syncerImage, imagePullSecret string, exposeHost string) error {
+	k3sArgs := []string{
+		"server",
+		"--disable=traefik,servicelb,metrics-server,local-storage",
+		"--disable-agent",
+		"--disable-cloud-controller",
+		"--disable-network-policy",
+		"--disable-helm-controller",
+		"--flannel-backend=none",
+		"--kube-controller-manager-arg=controllers=*,-nodeipam,-nodelifecycle,-persistentvolume-binder,-attachdetach,-persistentvolume-expander,-cloud-node-lifecycle,-ttl",
+		"--data-dir=/data/k3s",
+		"--tls-san=" + name + "." + ns + ".svc.cluster.local",
+		"--tls-san=" + name + "." + ns + ".svc",
+		"--tls-san=" + name,
+	}
+	if exposeHost != "" {
+		k3sArgs = append(k3sArgs, "--tls-san="+exposeHost)
+	}
+
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   name,
@@ -337,20 +378,7 @@ func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, n
 							Command: []string{
 								"k3s",
 							},
-							Args: []string{
-								"server",
-								"--disable=traefik,servicelb,metrics-server,local-storage",
-								"--disable-agent",
-								"--disable-cloud-controller",
-								"--disable-network-policy",
-								"--disable-helm-controller",
-								"--flannel-backend=none",
-								"--kube-controller-manager-arg=controllers=*,-nodeipam,-nodelifecycle,-persistentvolume-binder,-attachdetach,-persistentvolume-expander,-cloud-node-lifecycle,-ttl",
-								"--data-dir=/data/k3s",
-								"--tls-san=" + name + "." + ns + ".svc.cluster.local",
-								"--tls-san=" + name + "." + ns + ".svc",
-								"--tls-san=" + name,
-							},
+							Args: k3sArgs,
 							Ports: []corev1.ContainerPort{
 								{
 									Name:          "https",
@@ -455,6 +483,53 @@ func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, n
 
 	_, err := client.AppsV1().StatefulSets(ns).Create(ctx, sts, metav1.CreateOptions{})
 	return err
+}
+
+// BuildIngress returns an Ingress resource for the virtual cluster.
+func BuildIngress(name, ns string, labels map[string]string, host, ingressClass string) *networkingv1.Ingress {
+	pathType := networkingv1.PathTypeImplementationSpecific
+	ingress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			Labels:    labels,
+			Annotations: map[string]string{
+				"nginx.ingress.kubernetes.io/ssl-passthrough": "true",
+				"nginx.ingress.kubernetes.io/backend-protocol": "HTTPS",
+			},
+		},
+		Spec: networkingv1.IngressSpec{
+			Rules: []networkingv1.IngressRule{
+				{
+					Host: host,
+					IngressRuleValue: networkingv1.IngressRuleValue{
+						HTTP: &networkingv1.HTTPIngressRuleValue{
+							Paths: []networkingv1.HTTPIngressPath{
+								{
+									Path:     "/",
+									PathType: &pathType,
+									Backend: networkingv1.IngressBackend{
+										Service: &networkingv1.IngressServiceBackend{
+											Name: name,
+											Port: networkingv1.ServiceBackendPort{
+												Number: ServicePort,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if ingressClass != "" {
+		ingress.Spec.IngressClassName = ptr.To(ingressClass)
+	}
+
+	return ingress
 }
 
 // ListVirtualClusters returns info about all virtual clusters.
