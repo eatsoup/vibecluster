@@ -23,6 +23,7 @@ func NewRootCommand() *cobra.Command {
 		newListCommand(),
 		newConnectCommand(),
 		newLogsCommand(),
+		newExposeCommand(),
 		newOperatorCommand(),
 	)
 

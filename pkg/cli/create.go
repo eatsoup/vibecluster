@@ -10,11 +10,16 @@ import (
 )
 
 type createOptions struct {
-	connect         bool
-	timeout         time.Duration
-	print           bool
-	syncerImage     string
-	imagePullSecret string
+	connect            bool
+	timeout            time.Duration
+	updateKubeconfig   bool
+	kubeconfigOut      string
+	print              bool
+	syncerImage        string
+	imagePullSecret    string
+	exposeType         string
+	exposeIngressClass string
+	exposeHost         string
 }
 
 func newCreateCommand() *cobra.Command {
@@ -31,9 +36,14 @@ func newCreateCommand() *cobra.Command {
 
 	cmd.Flags().BoolVar(&opts.connect, "connect", true, "connect to the virtual cluster after creation")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 5*time.Minute, "timeout waiting for the virtual cluster to be ready")
+	cmd.Flags().BoolVar(&opts.updateKubeconfig, "update-kubeconfig", false, "merge the virtual cluster into your default kubeconfig")
+	cmd.Flags().StringVar(&opts.kubeconfigOut, "kubeconfig", "", "write kubeconfig to this file (default: ./vibecluster-<name>.kubeconfig)")
 	cmd.Flags().BoolVar(&opts.print, "print", false, "print kubeconfig to stdout instead of writing to file")
 	cmd.Flags().StringVar(&opts.syncerImage, "syncer-image", "", "override the syncer container image (default: ghcr.io/eatsoup/vibecluster/syncer:latest)")
 	cmd.Flags().StringVar(&opts.imagePullSecret, "image-pull-secret", "", "name of a dockerconfigjson secret (in default ns) to use for pulling images")
+	cmd.Flags().StringVar(&opts.exposeType, "expose", "", "exposure type for the cluster (LoadBalancer, Ingress)")
+	cmd.Flags().StringVar(&opts.exposeIngressClass, "expose-ingress-class", "", "ingress class if expose is Ingress")
+	cmd.Flags().StringVar(&opts.exposeHost, "expose-host", "", "ingress hostname if expose is Ingress")
 
 	return cmd
 }
@@ -47,8 +57,11 @@ func runCreate(name string, opts *createOptions) error {
 	ctx := cmd_context()
 
 	createOpts := k8s.CreateOptions{
-		SyncerImage:     opts.syncerImage,
-		ImagePullSecret: opts.imagePullSecret,
+		SyncerImage:        opts.syncerImage,
+		ImagePullSecret:    opts.imagePullSecret,
+		ExposeType:         opts.exposeType,
+		ExposeIngressClass: opts.exposeIngressClass,
+		ExposeHost:         opts.exposeHost,
 	}
 
 	fmt.Printf("Creating virtual cluster %q...\n", name)
@@ -87,15 +100,26 @@ func runCreate(name string, opts *createOptions) error {
 			return kubeconfig.Print(config)
 		}
 
-		if err := kubeconfig.WriteToFile(config, ""); err != nil {
+		outPath := opts.kubeconfigOut
+		if outPath == "" && !opts.updateKubeconfig {
+			outPath = fmt.Sprintf("./vibecluster-%s.kubeconfig", name)
+		}
+
+		if err := kubeconfig.WriteToFile(config, outPath); err != nil {
 			close(stopCh)
 			return fmt.Errorf("writing kubeconfig: %w", err)
 		}
 
 		contextName := "vibecluster-" + name
-		fmt.Printf("Kubeconfig written. Current context set to %q\n", contextName)
+		if opts.updateKubeconfig {
+			fmt.Printf("Kubeconfig updated in default location. Current context set to %q\n", contextName)
+		} else {
+			fmt.Printf("Kubeconfig written to %s\n", outPath)
+			fmt.Printf("To use: export KUBECONFIG=%s\n", outPath)
+		}
+		
 		fmt.Printf("Port-forward running on port %d. Press Ctrl+C to stop.\n", localPort)
-		fmt.Printf("\nTo use: kubectl get nodes\n")
+		fmt.Printf("\nTo see nodes: kubectl get nodes\n")
 
 		<-ctx.Done()
 		close(stopCh)
