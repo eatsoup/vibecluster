@@ -1,0 +1,116 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/eatsoup/vibecluster/pkg/syncer"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+func main() {
+	name := os.Getenv("VCLUSTER_NAME")
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "VCLUSTER_NAME environment variable is required")
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-ch
+		fmt.Println("Shutting down syncer...")
+		cancel()
+	}()
+
+	// Wait for k3s to be ready (kubeconfig file to appear)
+	vcKubeconfig := "/data/k3s/server/cred/admin.kubeconfig"
+	fmt.Printf("Waiting for k3s kubeconfig at %s...\n", vcKubeconfig)
+	if err := waitForFile(ctx, vcKubeconfig, 5*time.Minute); err != nil {
+		fmt.Fprintf(os.Stderr, "Error waiting for k3s: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Give k3s a moment to fully initialize after writing creds
+	time.Sleep(5 * time.Second)
+
+	// Build virtual cluster client from k3s kubeconfig
+	vcConfig, err := clientcmd.BuildConfigFromFlags("", vcKubeconfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading virtual cluster kubeconfig: %v\n", err)
+		os.Exit(1)
+	}
+
+	vClient, err := kubernetes.NewForConfig(vcConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating virtual cluster client: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Build host cluster client from in-cluster service account
+	hostConfig, err := rest.InClusterConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading host cluster config: %v\n", err)
+		os.Exit(1)
+	}
+
+	hostClient, err := kubernetes.NewForConfig(hostConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating host cluster client: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Wait for k3s API to actually be responding
+	fmt.Println("Waiting for virtual cluster API to be ready...")
+	if err := waitForAPI(ctx, vClient, 3*time.Minute); err != nil {
+		fmt.Fprintf(os.Stderr, "Error waiting for virtual cluster API: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Start syncing
+	s := syncer.New(name, hostClient, vClient)
+	if err := s.Run(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Syncer error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func waitForFile(ctx context.Context, path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return fmt.Errorf("timeout waiting for %s", path)
+}
+
+func waitForAPI(ctx context.Context, client *kubernetes.Clientset, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, err := client.Discovery().ServerVersion()
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return fmt.Errorf("timeout waiting for API server")
+}
