@@ -80,3 +80,17 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/eatsoup/vibecluster
             org.opencontainers.image.version=${{ steps.version.outputs.tag }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.operator
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/eatsoup/vibecluster/operator:${{ steps.version.outputs.tag }}
+            ghcr.io/eatsoup/vibecluster/operator:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/eatsoup/vibecluster
+            org.opencontainers.image.version=${{ steps.version.outputs.tag }}
