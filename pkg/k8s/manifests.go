@@ -16,12 +16,23 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+// CreateOptions holds options for virtual cluster creation.
+type CreateOptions struct {
+	SyncerImage     string
+	ImagePullSecret string // name of dockerconfigjson secret in default namespace to copy
+}
+
 // CreateVirtualCluster deploys all resources for a virtual cluster.
-func CreateVirtualCluster(ctx context.Context, client *kubernetes.Clientset, name string) error {
+func CreateVirtualCluster(ctx context.Context, client *kubernetes.Clientset, name string, opts CreateOptions) error {
 	ns := NamespaceName(name)
 	labels := Labels(name)
 	annotations := map[string]string{
 		AnnotationCreated: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	syncerImage := opts.SyncerImage
+	if syncerImage == "" {
+		syncerImage = SyncerImage
 	}
 
 	// 1. Create namespace
@@ -30,27 +41,35 @@ func CreateVirtualCluster(ctx context.Context, client *kubernetes.Clientset, nam
 		return fmt.Errorf("creating namespace: %w", err)
 	}
 
-	// 2. Create service account
+	// 2. Copy image pull secret into the namespace if specified
+	if opts.ImagePullSecret != "" {
+		fmt.Printf("  Copying image pull secret %q...\n", opts.ImagePullSecret)
+		if err := copySecret(ctx, client, opts.ImagePullSecret, "default", ns); err != nil {
+			return fmt.Errorf("copying image pull secret: %w", err)
+		}
+	}
+
+	// 3. Create service account
 	fmt.Printf("  Creating service account...\n")
-	if err := createServiceAccount(ctx, client, name, ns, labels); err != nil {
+	if err := createServiceAccount(ctx, client, name, ns, labels, opts.ImagePullSecret); err != nil {
 		return fmt.Errorf("creating service account: %w", err)
 	}
 
-	// 3. Create RBAC
+	// 4. Create RBAC
 	fmt.Printf("  Creating RBAC resources...\n")
 	if err := createRBAC(ctx, client, name, ns, labels); err != nil {
 		return fmt.Errorf("creating RBAC: %w", err)
 	}
 
-	// 4. Create services
+	// 5. Create services
 	fmt.Printf("  Creating services...\n")
 	if err := createServices(ctx, client, name, ns, labels); err != nil {
 		return fmt.Errorf("creating services: %w", err)
 	}
 
-	// 5. Create statefulset
+	// 6. Create statefulset
 	fmt.Printf("  Creating StatefulSet...\n")
-	if err := createStatefulSet(ctx, client, name, ns, labels); err != nil {
+	if err := createStatefulSet(ctx, client, name, ns, labels, syncerImage, opts.ImagePullSecret); err != nil {
 		return fmt.Errorf("creating statefulset: %w", err)
 	}
 
@@ -89,13 +108,41 @@ func createNamespace(ctx context.Context, client *kubernetes.Clientset, ns strin
 	return err
 }
 
-func createServiceAccount(ctx context.Context, client *kubernetes.Clientset, name, ns string, labels map[string]string) error {
-	_, err := client.CoreV1().ServiceAccounts(ns).Create(ctx, &corev1.ServiceAccount{
+func copySecret(ctx context.Context, client *kubernetes.Clientset, name, srcNS, dstNS string) error {
+	secret, err := client.CoreV1().Secrets(srcNS).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("getting secret %s/%s: %w", srcNS, name, err)
+	}
+
+	newSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secret.Name,
+			Namespace: dstNS,
+		},
+		Data: secret.Data,
+		Type: secret.Type,
+	}
+
+	_, err = client.CoreV1().Secrets(dstNS).Create(ctx, newSecret, metav1.CreateOptions{})
+	if errors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
+func createServiceAccount(ctx context.Context, client *kubernetes.Clientset, name, ns string, labels map[string]string, imagePullSecret string) error {
+	sa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "vc-" + name,
 			Labels: labels,
 		},
-	}, metav1.CreateOptions{})
+	}
+	if imagePullSecret != "" {
+		sa.ImagePullSecrets = []corev1.LocalObjectReference{
+			{Name: imagePullSecret},
+		}
+	}
+	_, err := client.CoreV1().ServiceAccounts(ns).Create(ctx, sa, metav1.CreateOptions{})
 	return err
 }
 
@@ -264,8 +311,8 @@ func createServices(ctx context.Context, client *kubernetes.Clientset, name, ns 
 	return err
 }
 
-func createStatefulSet(ctx context.Context, client *kubernetes.Clientset, name, ns string, labels map[string]string) error {
-	_, err := client.AppsV1().StatefulSets(ns).Create(ctx, &appsv1.StatefulSet{
+func createStatefulSet(ctx context.Context, client *kubernetes.Clientset, name, ns string, labels map[string]string, syncerImage, imagePullSecret string) error {
+	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   name,
 			Labels: labels,
@@ -353,7 +400,7 @@ func createStatefulSet(ctx context.Context, client *kubernetes.Clientset, name, 
 						},
 						{
 							Name:  "syncer",
-							Image: SyncerImage,
+							Image: syncerImage,
 							Env: []corev1.EnvVar{
 								{
 									Name:  "VCLUSTER_NAME",
@@ -398,7 +445,15 @@ func createStatefulSet(ctx context.Context, client *kubernetes.Clientset, name, 
 				},
 			},
 		},
-	}, metav1.CreateOptions{})
+	}
+
+	if imagePullSecret != "" {
+		sts.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
+			{Name: imagePullSecret},
+		}
+	}
+
+	_, err := client.AppsV1().StatefulSets(ns).Create(ctx, sts, metav1.CreateOptions{})
 	return err
 }
 

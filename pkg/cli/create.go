@@ -10,9 +10,11 @@ import (
 )
 
 type createOptions struct {
-	connect bool
-	timeout time.Duration
-	print   bool
+	connect         bool
+	timeout         time.Duration
+	print           bool
+	syncerImage     string
+	imagePullSecret string
 }
 
 func newCreateCommand() *cobra.Command {
@@ -30,6 +32,8 @@ func newCreateCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&opts.connect, "connect", true, "connect to the virtual cluster after creation")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 5*time.Minute, "timeout waiting for the virtual cluster to be ready")
 	cmd.Flags().BoolVar(&opts.print, "print", false, "print kubeconfig to stdout instead of writing to file")
+	cmd.Flags().StringVar(&opts.syncerImage, "syncer-image", "", "override the syncer container image (default: ghcr.io/eatsoup/vibecluster/syncer:latest)")
+	cmd.Flags().StringVar(&opts.imagePullSecret, "image-pull-secret", "", "name of a dockerconfigjson secret (in default ns) to use for pulling images")
 
 	return cmd
 }
@@ -42,8 +46,13 @@ func runCreate(name string, opts *createOptions) error {
 
 	ctx := cmd_context()
 
+	createOpts := k8s.CreateOptions{
+		SyncerImage:     opts.syncerImage,
+		ImagePullSecret: opts.imagePullSecret,
+	}
+
 	fmt.Printf("Creating virtual cluster %q...\n", name)
-	if err := k8s.CreateVirtualCluster(ctx, client, name); err != nil {
+	if err := k8s.CreateVirtualCluster(ctx, client, name, createOpts); err != nil {
 		return err
 	}
 
