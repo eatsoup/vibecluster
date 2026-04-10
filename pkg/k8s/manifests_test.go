@@ -6,6 +6,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -452,5 +453,128 @@ func TestK3sTLSSANs(t *testing.T) {
 		if !found {
 			t.Errorf("k3s args missing TLS SAN %q", want)
 		}
+	}
+}
+
+func TestExternalAddressURL(t *testing.T) {
+	cases := []struct {
+		name string
+		addr ExternalAddress
+		want string
+	}{
+		{"empty", ExternalAddress{}, ""},
+		{"port 443 omitted", ExternalAddress{Host: "10.0.0.1", Port: 443}, "https://10.0.0.1"},
+		{"port zero omitted", ExternalAddress{Host: "lb.example.com"}, "https://lb.example.com"},
+		{"non-standard port", ExternalAddress{Host: "host", Port: 8443}, "https://host:8443"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.addr.URL(); got != tc.want {
+				t.Errorf("URL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGetExternalAddress_LoadBalancerWithIP(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "lbcluster", Namespace: "vc-lbcluster"},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+		Status: corev1.ServiceStatus{
+			LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{IP: "203.0.113.5"}},
+			},
+		},
+	})
+	addr, err := GetExternalAddress(context.Background(), client, "lbcluster")
+	if err != nil {
+		t.Fatalf("GetExternalAddress: %v", err)
+	}
+	if addr.Host != "203.0.113.5" {
+		t.Errorf("Host = %q, want 203.0.113.5", addr.Host)
+	}
+	if addr.Source != "LoadBalancer" {
+		t.Errorf("Source = %q, want LoadBalancer", addr.Source)
+	}
+	if addr.CertVerifies {
+		t.Error("CertVerifies should be false for LB IPs (not in k3s SAN list)")
+	}
+}
+
+func TestGetExternalAddress_LoadBalancerWithHostname(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "lbcluster", Namespace: "vc-lbcluster"},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+		Status: corev1.ServiceStatus{
+			LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{Hostname: "lb.example.com"}},
+			},
+		},
+	})
+	addr, err := GetExternalAddress(context.Background(), client, "lbcluster")
+	if err != nil {
+		t.Fatalf("GetExternalAddress: %v", err)
+	}
+	if addr.Host != "lb.example.com" {
+		t.Errorf("Host = %q, want lb.example.com", addr.Host)
+	}
+}
+
+func TestGetExternalAddress_LoadBalancerPending(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "lbcluster", Namespace: "vc-lbcluster"},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+	})
+	addr, err := GetExternalAddress(context.Background(), client, "lbcluster")
+	if err != nil {
+		t.Fatalf("GetExternalAddress: %v", err)
+	}
+	if addr.Host != "" {
+		t.Errorf("Host should be empty while LB is pending, got %q", addr.Host)
+	}
+	if addr.Source != "LoadBalancer" {
+		t.Errorf("Source = %q, want LoadBalancer", addr.Source)
+	}
+}
+
+func TestGetExternalAddress_Ingress(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "ingcluster", Namespace: "vc-ingcluster"},
+			Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP},
+		},
+		&networkingv1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{Name: "ingcluster", Namespace: "vc-ingcluster"},
+			Spec: networkingv1.IngressSpec{
+				Rules: []networkingv1.IngressRule{{Host: "vc.example.com"}},
+			},
+		},
+	)
+	addr, err := GetExternalAddress(context.Background(), client, "ingcluster")
+	if err != nil {
+		t.Fatalf("GetExternalAddress: %v", err)
+	}
+	if addr.Host != "vc.example.com" {
+		t.Errorf("Host = %q, want vc.example.com", addr.Host)
+	}
+	if addr.Source != "Ingress" {
+		t.Errorf("Source = %q, want Ingress", addr.Source)
+	}
+	if !addr.CertVerifies {
+		t.Error("CertVerifies should be true for Ingress hosts (added to TLS-SAN)")
+	}
+}
+
+func TestGetExternalAddress_NoExposure(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "plain", Namespace: "vc-plain"},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP},
+	})
+	addr, err := GetExternalAddress(context.Background(), client, "plain")
+	if err != nil {
+		t.Fatalf("GetExternalAddress: %v", err)
+	}
+	if addr.Host != "" {
+		t.Errorf("Host should be empty for unexposed cluster, got %q", addr.Host)
 	}
 }
