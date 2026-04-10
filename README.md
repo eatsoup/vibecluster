@@ -102,6 +102,8 @@ vibecluster expose mycluster --type LoadBalancer
 vibecluster expose mycluster --type Ingress --host vc.example.com
 ```
 
+`expose` (without `--temp`) waits for the external address to materialise and writes a fresh kubeconfig pointing at it. For `--type Ingress`, the host is added to the k3s server certificate's TLS-SAN list, so the kubeconfig validates normally. For `--type LoadBalancer`, the assigned IP/hostname is **not** in the server certificate, so the generated kubeconfig is written with `insecure-skip-tls-verify: true`. If you need a verifying connection over a LoadBalancer, add the address to TLS-SANs yourself (e.g. by patching the StatefulSet args) and re-run `vibecluster connect`.
+
 ### Use the virtual cluster
 
 ```bash

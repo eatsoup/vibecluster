@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/eatsoup/vibecluster/pkg/k8s"
 	"github.com/eatsoup/vibecluster/pkg/kubeconfig"
@@ -35,7 +36,7 @@ func newExposeCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.ingressClass, "ingress-class", "", "ingress class if expose is Ingress")
 	cmd.Flags().StringVar(&opts.host, "host", "", "ingress hostname if expose is Ingress")
 	cmd.Flags().BoolVar(&opts.temp, "temp", false, "start an ephemeral port-forward to the virtual cluster API and block until Ctrl+C")
-	cmd.Flags().StringVar(&opts.kubeconfigOut, "kubeconfig", "", "with --temp, write a kubeconfig pointing at the local port-forward to this file (default: ./vibecluster-<name>.kubeconfig)")
+	cmd.Flags().StringVar(&opts.kubeconfigOut, "kubeconfig", "", "write a kubeconfig pointing at the new external address to this file (default: ./vibecluster-<name>.kubeconfig)")
 
 	return cmd
 }
@@ -96,7 +97,7 @@ func runExposeTemp(name string, opts *exposeOptions) error {
 }
 
 func runExposePersistent(name string, opts *exposeOptions) error {
-	client, _, err := k8s.NewClient(kubeContext)
+	client, restConfig, err := k8s.NewClient(kubeContext)
 	if err != nil {
 		return err
 	}
@@ -204,5 +205,35 @@ func runExposePersistent(name string, opts *exposeOptions) error {
 	}
 
 	fmt.Println("Expose configuration applied successfully.")
+
+	// Wait for the external address to materialise (LB IP, or just confirm Ingress host),
+	// then write a fresh kubeconfig pointing at it so users can connect immediately.
+	fmt.Println("Waiting for external address...")
+	addr, err := k8s.WaitForExternalAddress(ctx, client, name, 5*time.Minute)
+	if err != nil {
+		return fmt.Errorf("waiting for external address: %w", err)
+	}
+	fmt.Printf("External address: %s\n", addr.URL())
+
+	fmt.Println("Retrieving kubeconfig...")
+	cfg, err := kubeconfig.RetrieveWithOptions(ctx, client, restConfig, name, kubeconfig.RetrieveOptions{
+		Server:                addr.URL(),
+		InsecureSkipTLSVerify: !addr.CertVerifies,
+	})
+	if err != nil {
+		return fmt.Errorf("retrieving kubeconfig: %w", err)
+	}
+
+	outPath := opts.kubeconfigOut
+	if outPath == "" {
+		outPath = fmt.Sprintf("./vibecluster-%s.kubeconfig", name)
+	}
+	if err := kubeconfig.WriteToFile(cfg, outPath); err != nil {
+		return fmt.Errorf("writing kubeconfig: %w", err)
+	}
+	fmt.Printf("Kubeconfig written to %s\n", outPath)
+	if !addr.CertVerifies {
+		fmt.Println("Note: kubeconfig uses insecure-skip-tls-verify because the LoadBalancer address is not in the k3s server certificate SANs.")
+	}
 	return nil
 }
