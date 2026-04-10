@@ -72,7 +72,9 @@ This will:
 2. Deploy k3s + syncer as a StatefulSet
 3. Set up RBAC and services
 4. Wait for the cluster to be ready
-5. Set up port-forward and write kubeconfig
+5. Write a kubeconfig file (with the in-cluster service URL by default)
+
+`create` no longer starts a port-forward automatically. To reach the API server from your machine, either expose the cluster persistently or run an ephemeral port-forward — see [Expose](#expose-a-virtual-cluster).
 
 ### Connect to an existing virtual cluster
 
@@ -85,6 +87,19 @@ vibecluster connect mycluster --print
 
 # Write to a specific file
 vibecluster connect mycluster --kubeconfig ./my-kubeconfig.yaml
+```
+
+### Expose a virtual cluster
+
+```bash
+# Ephemeral port-forward — runs in the foreground until Ctrl+C
+vibecluster expose mycluster --temp
+
+# Persistent LoadBalancer
+vibecluster expose mycluster --type LoadBalancer
+
+# Persistent Ingress
+vibecluster expose mycluster --type Ingress --host vc.example.com
 ```
 
 ### Use the virtual cluster
