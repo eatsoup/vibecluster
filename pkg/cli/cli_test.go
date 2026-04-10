@@ -213,6 +213,56 @@ func TestOperatorCommand_Structure(t *testing.T) {
 	}
 }
 
+func TestExposeCommand_Flags(t *testing.T) {
+	cmd := NewRootCommand()
+	expose, _, err := cmd.Find([]string{"expose"})
+	if err != nil {
+		t.Fatalf("expose command not found: %v", err)
+	}
+
+	flags := []struct {
+		name         string
+		defaultValue string
+	}{
+		{"type", ""},
+		{"ingress-class", ""},
+		{"host", ""},
+		{"temp", "false"},
+		{"kubeconfig", ""},
+	}
+
+	for _, f := range flags {
+		flag := expose.Flags().Lookup(f.name)
+		if flag == nil {
+			t.Errorf("flag --%s not found", f.name)
+			continue
+		}
+		if flag.DefValue != f.defaultValue {
+			t.Errorf("flag --%s default = %q, want %q", f.name, flag.DefValue, f.defaultValue)
+		}
+	}
+}
+
+func TestExposeValidation_TempAndTypeMutuallyExclusive(t *testing.T) {
+	err := runExpose("foo", &exposeOptions{temp: true, exposeType: "LoadBalancer"})
+	if err == nil {
+		t.Fatal("expected error when both --temp and --type are set")
+	}
+	if got := err.Error(); got != "--temp and --type are mutually exclusive" {
+		t.Errorf("unexpected error: %q", got)
+	}
+}
+
+func TestExposeValidation_NeitherTempNorType(t *testing.T) {
+	err := runExpose("foo", &exposeOptions{})
+	if err == nil {
+		t.Fatal("expected error when neither --temp nor --type is set")
+	}
+	if got := err.Error(); got != "either --type or --temp must be specified" {
+		t.Errorf("unexpected error: %q", got)
+	}
+}
+
 func TestOperatorInstallCommand_Flags(t *testing.T) {
 	cmd := NewRootCommand()
 	installCmd, _, err := cmd.Find([]string{"operator", "install"})
