@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	"github.com/eatsoup/vibecluster/pkg/k8s"
 	"github.com/eatsoup/vibecluster/pkg/kubeconfig"
 	"github.com/spf13/cobra"
+	"k8s.io/client-go/rest"
 )
 
 type createOptions struct {
@@ -20,6 +22,8 @@ type createOptions struct {
 	exposeType         string
 	exposeIngressClass string
 	exposeHost         string
+	mode               string
+	crNamespace        string
 }
 
 func newCreateCommand() *cobra.Command {
@@ -44,6 +48,8 @@ func newCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.exposeType, "expose", "", "exposure type for the cluster (LoadBalancer, Ingress)")
 	cmd.Flags().StringVar(&opts.exposeIngressClass, "expose-ingress-class", "", "ingress class if expose is Ingress")
 	cmd.Flags().StringVar(&opts.exposeHost, "expose-host", "", "ingress hostname if expose is Ingress")
+	cmd.Flags().StringVar(&opts.mode, "mode", "auto", "creation mode: auto (use operator if available), legacy (raw manifests), or operator (require CRD)")
+	cmd.Flags().StringVar(&opts.crNamespace, "cr-namespace", k8s.DefaultCROperatorNamespace, "namespace to create the VirtualCluster CR in (operator mode only)")
 
 	return cmd
 }
@@ -55,6 +61,29 @@ func runCreate(name string, opts *createOptions) error {
 	}
 
 	ctx := cmd_context()
+
+	useOperator, err := resolveCreateMode(ctx, restConfig, opts.mode)
+	if err != nil {
+		return err
+	}
+
+	if useOperator {
+		fmt.Printf("Operator detected. Creating VirtualCluster CR %q in namespace %q...\n", name, opts.crNamespace)
+		if opts.exposeType != "" || opts.exposeHost != "" || opts.exposeIngressClass != "" {
+			fmt.Println("  Note: --expose flags are ignored in operator mode (CRD does not yet model expose).")
+		}
+		if opts.imagePullSecret != "" {
+			fmt.Println("  Note: --image-pull-secret is ignored in operator mode (CRD does not yet model it).")
+		}
+		spec := k8s.VirtualClusterCRSpec{
+			SyncerImage: opts.syncerImage,
+		}
+		if err := k8s.CreateVirtualClusterCR(ctx, restConfig, name, opts.crNamespace, spec); err != nil {
+			return fmt.Errorf("creating VirtualCluster CR: %w", err)
+		}
+		fmt.Println("VirtualCluster CR created. The operator will reconcile it; check 'vibecluster list' for status.")
+		return nil
+	}
 
 	createOpts := k8s.CreateOptions{
 		SyncerImage:        opts.syncerImage,
@@ -129,4 +158,36 @@ func runCreate(name string, opts *createOptions) error {
 	}
 
 	return nil
+}
+
+// resolveCreateMode decides whether to use the operator CR path based on the
+// requested mode and whether the CRD is installed in the host cluster.
+func resolveCreateMode(ctx context.Context, restConfig *rest.Config, mode string) (bool, error) {
+	// Avoid checking operator availability when the mode answer doesn't depend on it.
+	if mode == "legacy" {
+		return decideCreateMode(mode, false)
+	}
+	available, err := k8s.IsOperatorAvailable(ctx, restConfig)
+	if err != nil {
+		return false, fmt.Errorf("checking operator availability: %w", err)
+	}
+	return decideCreateMode(mode, available)
+}
+
+// decideCreateMode is the pure decision portion of resolveCreateMode and is
+// extracted so it can be unit-tested without a live host cluster.
+func decideCreateMode(mode string, operatorAvailable bool) (bool, error) {
+	switch mode {
+	case "legacy":
+		return false, nil
+	case "operator":
+		if !operatorAvailable {
+			return false, fmt.Errorf("--mode=operator requested but the VirtualCluster CRD is not installed (run `vibecluster operator install`)")
+		}
+		return true, nil
+	case "auto", "":
+		return operatorAvailable, nil
+	default:
+		return false, fmt.Errorf("invalid --mode %q (must be auto, legacy, or operator)", mode)
+	}
 }

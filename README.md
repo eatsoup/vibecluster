@@ -120,10 +120,12 @@ vibecluster list
 ```
 
 ```
-NAME        NAMESPACE      STATUS    CREATED
-mycluster   vc-mycluster   Running   2026-04-09T19:27:30Z
-dev         vc-dev         Running   2026-04-09T20:15:00Z
+NAME        NAMESPACE      STATUS    MODE       CREATED
+mycluster   vc-mycluster   Running   legacy     2026-04-09T19:27:30Z
+dev         vc-dev         Running   operator   2026-04-09T20:15:00Z
 ```
+
+The `MODE` column shows whether the cluster is managed by a `VirtualCluster` CR (`operator`) or by raw manifests created by the CLI (`legacy`). When the operator is installed, `list` also surfaces CRs whose backing namespace has not yet been created, with status `Pending`.
 
 ### View syncer/k3s logs
 
@@ -173,6 +175,10 @@ Synced resources on the host are labeled with:
 | `--connect` | `true` | Auto-connect after creation |
 | `--timeout` | `5m` | Timeout waiting for readiness |
 | `--print` | `false` | Print kubeconfig to stdout |
+| `--mode` | `auto` | Creation mode: `auto` (use the operator if installed, otherwise raw manifests), `legacy` (always raw manifests), or `operator` (require the CRD) |
+| `--cr-namespace` | `default` | Namespace to create the `VirtualCluster` CR in (operator mode only) |
+
+When `vibecluster create` runs in operator mode, the CLI submits a `VirtualCluster` CR for the operator to reconcile rather than creating manifests directly. Some flags only apply to the legacy manifest path: `--expose`, `--expose-host`, `--expose-ingress-class`, and `--image-pull-secret` are silently *informed about* (a notice is printed) and ignored when running in operator mode, because the CRD does not yet model those fields.
 
 ### Connect flags
 
