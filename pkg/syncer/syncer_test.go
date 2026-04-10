@@ -528,6 +528,139 @@ func TestSyncNodeToVirtual_Update(t *testing.T) {
 	}
 }
 
+func TestReconcileVirtualPodFromHost_BindsAndCopiesStatus(t *testing.T) {
+	vClient := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "nginx", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "nginx", Image: "nginx"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodPending},
+	})
+	s := New("test", nil, vClient)
+	ctx := context.Background()
+
+	hostPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-x-nginx-x-default",
+			Namespace: "vc-test",
+			Labels: map[string]string{
+				LabelSyncedFrom:       "test",
+				LabelVirtualName:      "nginx",
+				LabelVirtualNamespace: "default",
+			},
+		},
+		Spec: corev1.PodSpec{NodeName: "k3s01"},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodRunning,
+			PodIP:  "10.42.0.10",
+			HostIP: "10.0.0.50",
+		},
+	}
+
+	if err := s.reconcileVirtualPodFromHost(ctx, hostPod); err != nil {
+		t.Fatalf("reconcileVirtualPodFromHost failed: %v", err)
+	}
+
+	// Verify a Bind was issued. The fake client does not propagate the
+	// binding into spec.nodeName, so we check the action log instead.
+	var bound bool
+	for _, a := range vClient.Actions() {
+		if a.GetVerb() == "create" && a.GetSubresource() == "binding" {
+			bound = true
+			break
+		}
+	}
+	if !bound {
+		t.Errorf("expected a binding subresource create on the virtual pod")
+	}
+
+	vPod, err := vClient.CoreV1().Pods("default").Get(ctx, "nginx", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("virtual pod gone: %v", err)
+	}
+	if vPod.Status.Phase != corev1.PodRunning {
+		t.Errorf("phase = %q, want Running", vPod.Status.Phase)
+	}
+	if vPod.Status.PodIP != "10.42.0.10" {
+		t.Errorf("podIP = %q, want 10.42.0.10", vPod.Status.PodIP)
+	}
+}
+
+func TestReconcileVirtualPodFromHost_NoVirtualPod(t *testing.T) {
+	vClient := fake.NewSimpleClientset()
+	s := New("test", nil, vClient)
+	ctx := context.Background()
+
+	hostPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-x-ghost-x-default",
+			Namespace: "vc-test",
+			Labels: map[string]string{
+				LabelVirtualName:      "ghost",
+				LabelVirtualNamespace: "default",
+			},
+		},
+		Spec:   corev1.PodSpec{NodeName: "k3s01"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	// Should be a no-op, not an error.
+	if err := s.reconcileVirtualPodFromHost(ctx, hostPod); err != nil {
+		t.Fatalf("expected nil error for missing virtual pod, got %v", err)
+	}
+}
+
+func TestReconcileVirtualPodFromHost_NoLabels(t *testing.T) {
+	vClient := fake.NewSimpleClientset()
+	s := New("test", nil, vClient)
+	ctx := context.Background()
+
+	hostPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "unrelated",
+			Namespace: "vc-test",
+		},
+	}
+
+	// No labels means we cannot identify the virtual pod — should bail
+	// out cleanly without trying to call the virtual API.
+	if err := s.reconcileVirtualPodFromHost(ctx, hostPod); err != nil {
+		t.Fatalf("expected nil error for unlabeled host pod, got %v", err)
+	}
+}
+
+func TestReconcileVirtualPodFromHost_StatusOnlyUpdate(t *testing.T) {
+	vClient := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: "k3s01"},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	})
+	s := New("test", nil, vClient)
+	ctx := context.Background()
+
+	hostPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-x-app-x-default",
+			Namespace: "vc-test",
+			Labels: map[string]string{
+				LabelVirtualName:      "app",
+				LabelVirtualNamespace: "default",
+			},
+		},
+		Spec:   corev1.PodSpec{NodeName: "k3s01"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	if err := s.reconcileVirtualPodFromHost(ctx, hostPod); err != nil {
+		t.Fatalf("reconcileVirtualPodFromHost failed: %v", err)
+	}
+
+	vPod, _ := vClient.CoreV1().Pods("default").Get(ctx, "app", metav1.GetOptions{})
+	if vPod.Status.Phase != corev1.PodRunning {
+		t.Errorf("phase = %q, want Running", vPod.Status.Phase)
+	}
+}
+
 func TestNew(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
