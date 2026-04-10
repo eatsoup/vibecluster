@@ -150,24 +150,30 @@ func runCreate(name string, opts *createOptions) error {
 // resolveCreateMode decides whether to use the operator CR path based on the
 // requested mode and whether the CRD is installed in the host cluster.
 func resolveCreateMode(ctx context.Context, restConfig *rest.Config, mode string) (bool, error) {
+	// Avoid checking operator availability when the mode answer doesn't depend on it.
+	if mode == "legacy" {
+		return decideCreateMode(mode, false)
+	}
+	available, err := k8s.IsOperatorAvailable(ctx, restConfig)
+	if err != nil {
+		return false, fmt.Errorf("checking operator availability: %w", err)
+	}
+	return decideCreateMode(mode, available)
+}
+
+// decideCreateMode is the pure decision portion of resolveCreateMode and is
+// extracted so it can be unit-tested without a live host cluster.
+func decideCreateMode(mode string, operatorAvailable bool) (bool, error) {
 	switch mode {
 	case "legacy":
 		return false, nil
 	case "operator":
-		available, err := k8s.IsOperatorAvailable(ctx, restConfig)
-		if err != nil {
-			return false, fmt.Errorf("checking operator availability: %w", err)
-		}
-		if !available {
+		if !operatorAvailable {
 			return false, fmt.Errorf("--mode=operator requested but the VirtualCluster CRD is not installed (run `vibecluster operator install`)")
 		}
 		return true, nil
 	case "auto", "":
-		available, err := k8s.IsOperatorAvailable(ctx, restConfig)
-		if err != nil {
-			return false, fmt.Errorf("checking operator availability: %w", err)
-		}
-		return available, nil
+		return operatorAvailable, nil
 	default:
 		return false, fmt.Errorf("invalid --mode %q (must be auto, legacy, or operator)", mode)
 	}

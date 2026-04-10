@@ -213,6 +213,59 @@ func TestOperatorCommand_Structure(t *testing.T) {
 	}
 }
 
+func TestDecideCreateMode(t *testing.T) {
+	cases := []struct {
+		mode      string
+		available bool
+		want      bool
+		wantErr   bool
+	}{
+		{"legacy", false, false, false},
+		{"legacy", true, false, false}, // legacy ignores availability
+		{"operator", true, true, false},
+		{"operator", false, false, true}, // operator + missing CRD = error
+		{"auto", true, true, false},
+		{"auto", false, false, false},
+		{"", true, true, false}, // empty mode == auto
+		{"", false, false, false},
+		{"bogus", false, false, true}, // unknown mode = error
+	}
+	for _, tc := range cases {
+		got, err := decideCreateMode(tc.mode, tc.available)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("decideCreateMode(%q, %v): expected error, got nil", tc.mode, tc.available)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("decideCreateMode(%q, %v): unexpected error: %v", tc.mode, tc.available, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("decideCreateMode(%q, %v) = %v, want %v", tc.mode, tc.available, got, tc.want)
+		}
+	}
+}
+
+func TestCreateCommand_ModeFlags(t *testing.T) {
+	cmd := NewRootCommand()
+	create, _, err := cmd.Find([]string{"create"})
+	if err != nil {
+		t.Fatalf("create command not found: %v", err)
+	}
+	mode := create.Flags().Lookup("mode")
+	if mode == nil {
+		t.Fatal("--mode flag not found")
+	}
+	if mode.DefValue != "auto" {
+		t.Errorf("--mode default = %q, want auto", mode.DefValue)
+	}
+	if create.Flags().Lookup("cr-namespace") == nil {
+		t.Error("--cr-namespace flag not found")
+	}
+}
+
 func TestExposeCommand_Flags(t *testing.T) {
 	cmd := NewRootCommand()
 	expose, _, err := cmd.Find([]string{"expose"})

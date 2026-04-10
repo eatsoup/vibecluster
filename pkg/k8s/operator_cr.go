@@ -31,7 +31,12 @@ func IsOperatorAvailable(ctx context.Context, restConfig *rest.Config) (bool, er
 	if err != nil {
 		return false, fmt.Errorf("creating apiextensions client: %w", err)
 	}
-	_, err = extClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, CRDName, metav1.GetOptions{})
+	return isOperatorAvailableWith(ctx, extClient)
+}
+
+// isOperatorAvailableWith is the client-injectable variant used by tests.
+func isOperatorAvailableWith(ctx context.Context, extClient apiextensionsclient.Interface) (bool, error) {
+	_, err := extClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, CRDName, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		return false, nil
 	}
@@ -110,6 +115,11 @@ func FindVirtualClusterCR(ctx context.Context, restConfig *rest.Config, name str
 	if err != nil {
 		return "", fmt.Errorf("creating dynamic client: %w", err)
 	}
+	return findVirtualClusterCRWith(ctx, dynClient, name)
+}
+
+// findVirtualClusterCRWith is the client-injectable variant used by tests.
+func findVirtualClusterCRWith(ctx context.Context, dynClient dynamic.Interface, name string) (string, error) {
 	list, err := dynClient.Resource(VirtualClusterGVR).Namespace("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -138,6 +148,11 @@ func ListVirtualClusterCRs(ctx context.Context, restConfig *rest.Config) ([]VClu
 	if err != nil {
 		return nil, fmt.Errorf("creating dynamic client: %w", err)
 	}
+	return listVirtualClusterCRsWith(ctx, dynClient)
+}
+
+// listVirtualClusterCRsWith is the client-injectable variant used by tests.
+func listVirtualClusterCRsWith(ctx context.Context, dynClient dynamic.Interface) ([]VClusterCR, error) {
 	list, err := dynClient.Resource(VirtualClusterGVR).Namespace("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
