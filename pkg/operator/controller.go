@@ -9,6 +9,7 @@ import (
 	"github.com/eatsoup/vibecluster/pkg/k8s"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -38,8 +39,9 @@ type VirtualClusterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;delete;bind;escalate
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;delete;bind;escalate
 
 // Reconcile handles the reconciliation loop for VirtualCluster resources.
 func (r *VirtualClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -103,7 +105,12 @@ func (r *VirtualClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return r.updateStatus(ctx, &vc, vibeclusterv1alpha1.VirtualClusterPhaseFailed, false, fmt.Sprintf("Failed to create StatefulSet: %v", err), opts.Namespace)
 	}
 
-	// 6. Check StatefulSet readiness
+	// 6. Ensure Ingress (if expose.type == Ingress)
+	if err := r.ensureIngress(ctx, opts); err != nil {
+		return r.updateStatus(ctx, &vc, vibeclusterv1alpha1.VirtualClusterPhaseFailed, false, fmt.Sprintf("Failed to create Ingress: %v", err), opts.Namespace)
+	}
+
+	// 7. Check StatefulSet readiness
 	ready, msg := r.checkReadiness(ctx, opts)
 	if ready {
 		return r.updateStatus(ctx, &vc, vibeclusterv1alpha1.VirtualClusterPhaseRunning, true, "Virtual cluster is running", opts.Namespace)
@@ -129,6 +136,11 @@ func (r *VirtualClusterReconciler) buildOptions(vc *vibeclusterv1alpha1.VirtualC
 	}
 	if vc.Spec.Storage != "" {
 		opts.Storage = vc.Spec.Storage
+	}
+	if vc.Spec.Expose != nil {
+		opts.ExposeType = string(vc.Spec.Expose.Type)
+		opts.ExposeHost = vc.Spec.Expose.Host
+		opts.ExposeIngressClass = vc.Spec.Expose.IngressClass
 	}
 
 	return opts
@@ -261,16 +273,28 @@ func (r *VirtualClusterReconciler) ensureRBAC(ctx context.Context, opts k8s.Buil
 }
 
 // ensureServices creates the main and headless services if they don't exist.
+// Reconciles the main Service type with the desired ExposeType so flipping
+// `spec.expose.type` between LoadBalancer and ClusterIP/Ingress takes effect.
 func (r *VirtualClusterReconciler) ensureServices(ctx context.Context, opts k8s.BuilderOptions) error {
 	// Main service
 	svc := k8s.BuildService(opts)
 	existing := &corev1.Service{}
-	if err := r.Get(ctx, types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace}, existing); errors.IsNotFound(err) {
+	err := r.Get(ctx, types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace}, existing)
+	if errors.IsNotFound(err) {
 		if err := r.Create(ctx, svc); err != nil {
 			return fmt.Errorf("creating service: %w", err)
 		}
 	} else if err != nil {
 		return err
+	} else if existing.Spec.Type != svc.Spec.Type {
+		// Type change requires clearing fields incompatible with the new type.
+		existing.Spec.Type = svc.Spec.Type
+		if svc.Spec.Type == corev1.ServiceTypeClusterIP {
+			existing.Spec.Ports = svc.Spec.Ports
+		}
+		if err := r.Update(ctx, existing); err != nil {
+			return fmt.Errorf("updating service type: %w", err)
+		}
 	}
 
 	// Headless service
@@ -287,7 +311,58 @@ func (r *VirtualClusterReconciler) ensureServices(ctx context.Context, opts k8s.
 	return nil
 }
 
-// ensureStatefulSet creates or updates the StatefulSet.
+// ensureIngress reconciles the Ingress for the virtual cluster API. When
+// ExposeType is "Ingress" the Ingress is created or updated; for any other
+// ExposeType (or none) any pre-existing Ingress is removed.
+func (r *VirtualClusterReconciler) ensureIngress(ctx context.Context, opts k8s.BuilderOptions) error {
+	if opts.ExposeType != "Ingress" {
+		// Clean up if a previous reconcile created one.
+		existing := &networkingv1.Ingress{}
+		err := r.Get(ctx, types.NamespacedName{Name: opts.Name, Namespace: opts.Namespace}, existing)
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := r.Delete(ctx, existing); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("deleting stale ingress: %w", err)
+		}
+		return nil
+	}
+
+	if opts.ExposeHost == "" {
+		return fmt.Errorf("expose.host is required when expose.type is Ingress")
+	}
+
+	desired := k8s.BuildIngress(opts.Name, opts.Namespace, opts.Labels, opts.ExposeHost, opts.ExposeIngressClass)
+	existing := &networkingv1.Ingress{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	if errors.IsNotFound(err) {
+		if err := r.Create(ctx, desired); err != nil {
+			return fmt.Errorf("creating ingress: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	existing.Spec = desired.Spec
+	if existing.Annotations == nil {
+		existing.Annotations = map[string]string{}
+	}
+	for k, v := range desired.Annotations {
+		existing.Annotations[k] = v
+	}
+	if err := r.Update(ctx, existing); err != nil {
+		return fmt.Errorf("updating ingress: %w", err)
+	}
+	return nil
+}
+
+// ensureStatefulSet creates or updates the StatefulSet. Container images and
+// the k3s args (which carry the TLS-SAN list — including the expose host)
+// are reconciled in place.
 func (r *VirtualClusterReconciler) ensureStatefulSet(ctx context.Context, opts k8s.BuilderOptions) error {
 	desired := k8s.BuildStatefulSet(opts)
 	existing := &appsv1.StatefulSet{}
@@ -298,12 +373,19 @@ func (r *VirtualClusterReconciler) ensureStatefulSet(ctx context.Context, opts k
 		return err
 	}
 
-	// Update container images if changed
 	needsUpdate := false
 	for i, c := range existing.Spec.Template.Spec.Containers {
 		for _, dc := range desired.Spec.Template.Spec.Containers {
-			if c.Name == dc.Name && c.Image != dc.Image {
+			if c.Name != dc.Name {
+				continue
+			}
+			if c.Image != dc.Image {
 				existing.Spec.Template.Spec.Containers[i].Image = dc.Image
+				needsUpdate = true
+			}
+			// Reconcile k3s args so the expose host appears in TLS-SAN.
+			if c.Name == "k3s" && !stringSlicesEqual(c.Args, dc.Args) {
+				existing.Spec.Template.Spec.Containers[i].Args = dc.Args
 				needsUpdate = true
 			}
 		}
@@ -314,6 +396,18 @@ func (r *VirtualClusterReconciler) ensureStatefulSet(ctx context.Context, opts k
 	}
 
 	return nil
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // checkReadiness checks if the StatefulSet has ready replicas.

@@ -178,7 +178,7 @@ Synced resources on the host are labeled with:
 | `--mode` | `auto` | Creation mode: `auto` (use the operator if installed, otherwise raw manifests), `legacy` (always raw manifests), or `operator` (require the CRD) |
 | `--cr-namespace` | `default` | Namespace to create the `VirtualCluster` CR in (operator mode only) |
 
-When `vibecluster create` runs in operator mode, the CLI submits a `VirtualCluster` CR for the operator to reconcile rather than creating manifests directly. Some flags only apply to the legacy manifest path: `--expose`, `--expose-host`, `--expose-ingress-class`, and `--image-pull-secret` are silently *informed about* (a notice is printed) and ignored when running in operator mode, because the CRD does not yet model those fields.
+When `vibecluster create` runs in operator mode, the CLI submits a `VirtualCluster` CR for the operator to reconcile rather than creating manifests directly. The `--expose`, `--expose-host`, and `--expose-ingress-class` flags are translated into the CR's `spec.expose` field, so the operator stands up the LoadBalancer or Ingress as part of reconciliation. `--image-pull-secret` is the only legacy-only flag — the CRD does not yet model it, so it's ignored in operator mode (a notice is printed).
 
 ### Connect flags
 
@@ -257,6 +257,24 @@ dev-cluster   Running   true    vc-dev-cluster    5m
 | `k3sImage` | `rancher/k3s:v1.28.5-k3s1` | k3s container image |
 | `syncerImage` | `ghcr.io/eatsoup/vibecluster/syncer:latest` | Syncer sidecar image |
 | `storage` | `5Gi` | Persistent volume size for k3s data |
+| `expose.type` | _(unset)_ | `LoadBalancer` or `Ingress`. When unset the cluster is only reachable via its in-cluster ClusterIP service. |
+| `expose.host` | _(unset)_ | External hostname. Required for `Ingress`; also added to the k3s server certificate's TLS-SAN list so kubeconfigs validate. |
+| `expose.ingressClass` | _(unset)_ | `IngressClassName` to use when `expose.type` is `Ingress`. |
+
+Example with persistent Ingress exposure:
+
+```yaml
+apiVersion: vibecluster.dev/v1alpha1
+kind: VirtualCluster
+metadata:
+  name: dev-cluster
+  namespace: default
+spec:
+  expose:
+    type: Ingress
+    host: dev.vc.example.com
+    ingressClass: nginx
+```
 
 ### VirtualCluster status fields
 

@@ -21,6 +21,39 @@ type VirtualClusterSpec struct {
 	// +optional
 	// +kubebuilder:default="5Gi"
 	Storage string `json:"storage,omitempty"`
+
+	// Expose configures how the virtual cluster's API server is exposed
+	// outside the host cluster. When unset, the cluster is only reachable via
+	// its in-cluster ClusterIP service.
+	// +optional
+	Expose *VirtualClusterExpose `json:"expose,omitempty"`
+}
+
+// VirtualClusterExposeType is the strategy used to expose the virtual cluster API.
+// +kubebuilder:validation:Enum=LoadBalancer;Ingress
+type VirtualClusterExposeType string
+
+const (
+	// VirtualClusterExposeLoadBalancer creates a Service of type LoadBalancer
+	// fronting the k3s API.
+	VirtualClusterExposeLoadBalancer VirtualClusterExposeType = "LoadBalancer"
+	// VirtualClusterExposeIngress creates an Ingress fronting the k3s API.
+	VirtualClusterExposeIngress VirtualClusterExposeType = "Ingress"
+)
+
+// VirtualClusterExpose configures external exposure of the virtual cluster API.
+type VirtualClusterExpose struct {
+	// Type is the exposure strategy: "LoadBalancer" or "Ingress".
+	Type VirtualClusterExposeType `json:"type"`
+
+	// Host is the external hostname. Required for type "Ingress"; the host
+	// is also added to the k3s server certificate's TLS-SAN list.
+	// +optional
+	Host string `json:"host,omitempty"`
+
+	// IngressClass is the IngressClassName to use when type is "Ingress".
+	// +optional
+	IngressClass string `json:"ingressClass,omitempty"`
 }
 
 // VirtualClusterPhase represents the lifecycle phase of a VirtualCluster.

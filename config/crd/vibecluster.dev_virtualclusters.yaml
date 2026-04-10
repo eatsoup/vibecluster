@@ -63,6 +63,24 @@ spec:
                   type: string
                   default: "5Gi"
                   pattern: "^[0-9]+(Ki|Mi|Gi|Ti|Pi|Ei)?$"
+                expose:
+                  description: Expose configures how the virtual cluster's API server is exposed outside the host cluster.
+                  type: object
+                  required:
+                    - type
+                  properties:
+                    type:
+                      description: Type is the exposure strategy.
+                      type: string
+                      enum:
+                        - LoadBalancer
+                        - Ingress
+                    host:
+                      description: Host is the external hostname. Required for type Ingress; also added to the k3s server certificate's TLS-SAN list.
+                      type: string
+                    ingressClass:
+                      description: IngressClass is the IngressClassName to use when type is Ingress.
+                      type: string
             status:
               description: VirtualClusterStatus defines the observed state of a VirtualCluster.
               type: object
