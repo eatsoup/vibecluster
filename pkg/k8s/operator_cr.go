@@ -52,6 +52,18 @@ type VirtualClusterCRSpec struct {
 	K3sImage    string
 	SyncerImage string
 	Storage     string
+	// Expose configures external API exposure. nil means in-cluster only.
+	Expose *VirtualClusterCRExpose
+}
+
+// VirtualClusterCRExpose mirrors api/v1alpha1.VirtualClusterExpose for the CLI.
+type VirtualClusterCRExpose struct {
+	// Type is "LoadBalancer" or "Ingress".
+	Type string
+	// Host is the external hostname (required for Ingress).
+	Host string
+	// IngressClass is the IngressClassName for Ingress exposure.
+	IngressClass string
 }
 
 // CreateVirtualClusterCR creates a VirtualCluster custom resource via the dynamic client.
@@ -60,7 +72,11 @@ func CreateVirtualClusterCR(ctx context.Context, restConfig *rest.Config, name, 
 	if err != nil {
 		return fmt.Errorf("creating dynamic client: %w", err)
 	}
+	return createVirtualClusterCRWith(ctx, dynClient, name, namespace, spec)
+}
 
+// createVirtualClusterCRWith is the client-injectable variant used by tests.
+func createVirtualClusterCRWith(ctx context.Context, dynClient dynamic.Interface, name, namespace string, spec VirtualClusterCRSpec) error {
 	specMap := map[string]interface{}{}
 	if spec.K3sImage != "" {
 		specMap["k3sImage"] = spec.K3sImage
@@ -70,6 +86,18 @@ func CreateVirtualClusterCR(ctx context.Context, restConfig *rest.Config, name, 
 	}
 	if spec.Storage != "" {
 		specMap["storage"] = spec.Storage
+	}
+	if spec.Expose != nil {
+		exposeMap := map[string]interface{}{
+			"type": spec.Expose.Type,
+		}
+		if spec.Expose.Host != "" {
+			exposeMap["host"] = spec.Expose.Host
+		}
+		if spec.Expose.IngressClass != "" {
+			exposeMap["ingressClass"] = spec.Expose.IngressClass
+		}
+		specMap["expose"] = exposeMap
 	}
 
 	obj := &unstructured.Unstructured{
@@ -84,7 +112,7 @@ func CreateVirtualClusterCR(ctx context.Context, restConfig *rest.Config, name, 
 		},
 	}
 
-	_, err = dynClient.Resource(VirtualClusterGVR).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
+	_, err := dynClient.Resource(VirtualClusterGVR).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
 	if errors.IsAlreadyExists(err) {
 		return fmt.Errorf("VirtualCluster %s/%s already exists", namespace, name)
 	}

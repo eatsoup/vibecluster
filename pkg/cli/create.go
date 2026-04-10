@@ -69,14 +69,20 @@ func runCreate(name string, opts *createOptions) error {
 
 	if useOperator {
 		fmt.Printf("Operator detected. Creating VirtualCluster CR %q in namespace %q...\n", name, opts.crNamespace)
-		if opts.exposeType != "" || opts.exposeHost != "" || opts.exposeIngressClass != "" {
-			fmt.Println("  Note: --expose flags are ignored in operator mode (CRD does not yet model expose).")
-		}
 		if opts.imagePullSecret != "" {
 			fmt.Println("  Note: --image-pull-secret is ignored in operator mode (CRD does not yet model it).")
 		}
 		spec := k8s.VirtualClusterCRSpec{
 			SyncerImage: opts.syncerImage,
+		}
+		if opts.exposeType != "" {
+			spec.Expose = &k8s.VirtualClusterCRExpose{
+				Type:         opts.exposeType,
+				Host:         opts.exposeHost,
+				IngressClass: opts.exposeIngressClass,
+			}
+		} else if opts.exposeHost != "" || opts.exposeIngressClass != "" {
+			return fmt.Errorf("--expose-host/--expose-ingress-class require --expose=Ingress or --expose=LoadBalancer")
 		}
 		if err := k8s.CreateVirtualClusterCR(ctx, restConfig, name, opts.crNamespace, spec); err != nil {
 			return fmt.Errorf("creating VirtualCluster CR: %w", err)

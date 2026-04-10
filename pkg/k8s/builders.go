@@ -27,6 +27,15 @@ type BuilderOptions struct {
 	Storage string
 	// ImagePullSecret is the name of a dockerconfigjson secret for image pulls.
 	ImagePullSecret string
+	// ExposeType configures the API service exposure: "" (ClusterIP only),
+	// "LoadBalancer", or "Ingress".
+	ExposeType string
+	// ExposeHost is the external hostname for Ingress exposure. When set, it
+	// is appended to the k3s server certificate's TLS-SAN list so a kubeconfig
+	// pointing at the host validates against the cluster's serving cert.
+	ExposeHost string
+	// ExposeIngressClass is the IngressClassName to use when ExposeType is "Ingress".
+	ExposeIngressClass string
 }
 
 // DefaultBuilderOptions returns BuilderOptions with sensible defaults for the given name.
@@ -74,6 +83,56 @@ func ClusterRoleName(name, ns string) string {
 	return "vc-" + name + "-" + ns
 }
 
+// SyncerClusterRoleRules returns the policy rules granted to the per-vcluster
+// syncer ClusterRole. It is exported so the operator install path can mirror
+// these rules into its own ClusterRole — without that mirror the operator
+// cannot create per-vcluster ClusterRoles (Kubernetes blocks privilege
+// escalation: a subject cannot grant permissions it does not itself hold).
+func SyncerClusterRoleRules() []rbacv1.PolicyRule {
+	return []rbacv1.PolicyRule{
+		{
+			APIGroups: []string{""},
+			Resources: []string{"pods", "pods/status", "pods/log", "pods/exec", "pods/attach", "pods/portforward"},
+			Verbs:     []string{"*"},
+		},
+		{
+			APIGroups: []string{""},
+			Resources: []string{"services", "endpoints", "configmaps", "secrets", "serviceaccounts"},
+			Verbs:     []string{"*"},
+		},
+		{
+			APIGroups: []string{""},
+			Resources: []string{"events"},
+			Verbs:     []string{"create", "patch", "update"},
+		},
+		{
+			APIGroups: []string{""},
+			Resources: []string{"persistentvolumeclaims"},
+			Verbs:     []string{"*"},
+		},
+		{
+			APIGroups: []string{""},
+			Resources: []string{"nodes", "nodes/status", "nodes/metrics", "nodes/proxy"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
+			APIGroups: []string{"apps"},
+			Resources: []string{"statefulsets", "deployments", "replicasets", "daemonsets"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
+			APIGroups: []string{"networking.k8s.io"},
+			Resources: []string{"ingresses"},
+			Verbs:     []string{"*"},
+		},
+		{
+			APIGroups: []string{"storage.k8s.io"},
+			Resources: []string{"storageclasses", "csinodes", "csidrivers"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+	}
+}
+
 // BuildClusterRole returns the ClusterRole for the syncer.
 func BuildClusterRole(opts BuilderOptions) *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
@@ -81,48 +140,7 @@ func BuildClusterRole(opts BuilderOptions) *rbacv1.ClusterRole {
 			Name:   ClusterRoleName(opts.Name, opts.Namespace),
 			Labels: opts.Labels,
 		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{""},
-				Resources: []string{"pods", "pods/status", "pods/log", "pods/exec", "pods/attach", "pods/portforward"},
-				Verbs:     []string{"*"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"services", "endpoints", "configmaps", "secrets", "serviceaccounts"},
-				Verbs:     []string{"*"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"events"},
-				Verbs:     []string{"create", "patch", "update"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"persistentvolumeclaims"},
-				Verbs:     []string{"*"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"nodes", "nodes/status", "nodes/metrics", "nodes/proxy"},
-				Verbs:     []string{"get", "list", "watch"},
-			},
-			{
-				APIGroups: []string{"apps"},
-				Resources: []string{"statefulsets", "deployments", "replicasets", "daemonsets"},
-				Verbs:     []string{"get", "list", "watch"},
-			},
-			{
-				APIGroups: []string{"networking.k8s.io"},
-				Resources: []string{"ingresses"},
-				Verbs:     []string{"*"},
-			},
-			{
-				APIGroups: []string{"storage.k8s.io"},
-				Resources: []string{"storageclasses", "csinodes", "csidrivers"},
-				Verbs:     []string{"get", "list", "watch"},
-			},
-		},
+		Rules: SyncerClusterRoleRules(),
 	}
 }
 
@@ -190,8 +208,14 @@ func BuildRoleBinding(opts BuilderOptions) *rbacv1.RoleBinding {
 	}
 }
 
-// BuildService returns the main ClusterIP service for the virtual cluster.
+// BuildService returns the main service for the virtual cluster. The Service
+// type is LoadBalancer when opts.ExposeType == "LoadBalancer", otherwise
+// ClusterIP.
 func BuildService(opts BuilderOptions) *corev1.Service {
+	svcType := corev1.ServiceTypeClusterIP
+	if opts.ExposeType == "LoadBalancer" {
+		svcType = corev1.ServiceTypeLoadBalancer
+	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      opts.Name,
@@ -199,7 +223,7 @@ func BuildService(opts BuilderOptions) *corev1.Service {
 			Labels:    opts.Labels,
 		},
 		Spec: corev1.ServiceSpec{
-			Type:     corev1.ServiceTypeClusterIP,
+			Type:     svcType,
 			Selector: opts.Labels,
 			Ports: []corev1.ServicePort{
 				{
@@ -235,6 +259,34 @@ func BuildHeadlessService(opts BuilderOptions) *corev1.Service {
 			},
 		},
 	}
+}
+
+// k3sArgs returns the command-line args for the k3s server container.
+// It is exported via BuildStatefulSet — kept separate so the expose host
+// can be appended to the TLS-SAN list when set.
+func k3sArgs(opts BuilderOptions) []string {
+	args := []string{
+		"server",
+		// coredns is disabled because the virtual cluster has no kubelet
+		// (--disable-agent) and no CNI (--flannel-backend=none), so the
+		// coredns Deployment k3s ships would never schedule. The syncer
+		// skips kube-system and cannot translate it. See issue #5.
+		"--disable=traefik,servicelb,metrics-server,local-storage,coredns",
+		"--disable-agent",
+		"--disable-cloud-controller",
+		"--disable-network-policy",
+		"--disable-helm-controller",
+		"--flannel-backend=none",
+		"--kube-controller-manager-arg=controllers=*,-nodeipam,-nodelifecycle,-persistentvolume-binder,-attachdetach,-persistentvolume-expander,-cloud-node-lifecycle,-ttl",
+		"--data-dir=/data/k3s",
+		"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc.cluster.local",
+		"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc",
+		"--tls-san=" + opts.Name,
+	}
+	if opts.ExposeHost != "" {
+		args = append(args, "--tls-san="+opts.ExposeHost)
+	}
+	return args
 }
 
 // BuildStatefulSet returns the StatefulSet for the virtual cluster (k3s + syncer).
@@ -278,24 +330,7 @@ func BuildStatefulSet(opts BuilderOptions) *appsv1.StatefulSet {
 							Command: []string{
 								"k3s",
 							},
-							Args: []string{
-								"server",
-								// coredns is disabled because the virtual cluster has no kubelet
-								// (--disable-agent) and no CNI (--flannel-backend=none), so the
-								// coredns Deployment k3s ships would never schedule. The syncer
-								// skips kube-system and cannot translate it. See issue #5.
-								"--disable=traefik,servicelb,metrics-server,local-storage,coredns",
-								"--disable-agent",
-								"--disable-cloud-controller",
-								"--disable-network-policy",
-								"--disable-helm-controller",
-								"--flannel-backend=none",
-								"--kube-controller-manager-arg=controllers=*,-nodeipam,-nodelifecycle,-persistentvolume-binder,-attachdetach,-persistentvolume-expander,-cloud-node-lifecycle,-ttl",
-								"--data-dir=/data/k3s",
-								"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc.cluster.local",
-								"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc",
-								"--tls-san=" + opts.Name,
-							},
+							Args: k3sArgs(opts),
 							Ports: []corev1.ContainerPort{
 								{
 									Name:          "https",

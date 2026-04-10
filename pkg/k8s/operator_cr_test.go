@@ -121,6 +121,66 @@ func TestListVirtualClusterCRs(t *testing.T) {
 	}
 }
 
+func TestCreateVirtualClusterCR_PopulatesExpose(t *testing.T) {
+	scheme := runtime.NewScheme()
+	gvrToListKind := map[schema.GroupVersionResource]string{
+		VirtualClusterGVR: "VirtualClusterList",
+	}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind)
+
+	spec := VirtualClusterCRSpec{
+		SyncerImage: "ghcr.io/example/syncer:v1",
+		Expose: &VirtualClusterCRExpose{
+			Type:         "Ingress",
+			Host:         "vc.example.com",
+			IngressClass: "nginx",
+		},
+	}
+	if err := createVirtualClusterCRWith(context.Background(), dyn, "ingvc", "default", spec); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+
+	got, err := dyn.Resource(VirtualClusterGVR).Namespace("default").Get(context.Background(), "ingvc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	exposeType, _, _ := unstructured.NestedString(got.Object, "spec", "expose", "type")
+	if exposeType != "Ingress" {
+		t.Errorf("spec.expose.type = %q, want Ingress", exposeType)
+	}
+	host, _, _ := unstructured.NestedString(got.Object, "spec", "expose", "host")
+	if host != "vc.example.com" {
+		t.Errorf("spec.expose.host = %q, want vc.example.com", host)
+	}
+	ic, _, _ := unstructured.NestedString(got.Object, "spec", "expose", "ingressClass")
+	if ic != "nginx" {
+		t.Errorf("spec.expose.ingressClass = %q, want nginx", ic)
+	}
+	syncer, _, _ := unstructured.NestedString(got.Object, "spec", "syncerImage")
+	if syncer != "ghcr.io/example/syncer:v1" {
+		t.Errorf("spec.syncerImage = %q, want ghcr.io/example/syncer:v1", syncer)
+	}
+}
+
+func TestCreateVirtualClusterCR_NoExposeOmitsField(t *testing.T) {
+	scheme := runtime.NewScheme()
+	gvrToListKind := map[schema.GroupVersionResource]string{
+		VirtualClusterGVR: "VirtualClusterList",
+	}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind)
+
+	if err := createVirtualClusterCRWith(context.Background(), dyn, "noexp", "default", VirtualClusterCRSpec{}); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+	got, err := dyn.Resource(VirtualClusterGVR).Namespace("default").Get(context.Background(), "noexp", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	if _, found, _ := unstructured.NestedMap(got.Object, "spec", "expose"); found {
+		t.Errorf("spec.expose should be omitted when no expose configured")
+	}
+}
+
 func TestListVirtualClusterCRs_Empty(t *testing.T) {
 	dyn := newDynamicFake(t)
 	got, err := listVirtualClusterCRsWith(context.Background(), dyn)

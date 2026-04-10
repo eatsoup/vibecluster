@@ -42,13 +42,22 @@ rules:
     resources: ["statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
 
-  # RBAC management (operator creates roles for vcluster syncers)
+  # Ingress management (for `expose` of type Ingress)
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # RBAC management (operator creates roles for vcluster syncers).
+  # `bind` and `escalate` are required because the per-vcluster Role grants
+  # `*` on `*` — a superset of every permission in the cluster — and
+  # Kubernetes blocks granting permissions you don't yourself hold unless
+  # you have escalate/bind on the target.
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["clusterroles", "clusterrolebindings"]
-    verbs: ["get", "list", "watch", "create", "update", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "delete", "bind", "escalate"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
-    verbs: ["get", "list", "watch", "create", "update", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "delete", "bind", "escalate"]
 
   # Events
   - apiGroups: [""]
@@ -59,6 +68,36 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # The following rules mirror the per-vcluster syncer ClusterRole. Without
+  # this mirror, the operator cannot create the per-vcluster ClusterRole
+  # (Kubernetes blocks privilege escalation: a subject cannot grant
+  # permissions it does not itself hold). Keep in sync with
+  # k8s.SyncerClusterRoleRules in pkg/k8s/builders.go.
+  - apiGroups: [""]
+    resources: ["pods", "pods/status", "pods/log", "pods/exec", "pods/attach", "pods/portforward"]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "configmaps", "secrets", "serviceaccounts"]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/status", "nodes/metrics", "nodes/proxy"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "deployments", "replicasets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["*"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes", "csidrivers"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

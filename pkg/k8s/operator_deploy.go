@@ -147,33 +147,56 @@ func ensureOperatorServiceAccount(ctx context.Context, client kubernetes.Interfa
 }
 
 func ensureOperatorRBAC(ctx context.Context, client kubernetes.Interface, labels map[string]string) error {
+	// Operator-management rules: things the controller itself reads/writes when
+	// reconciling a VirtualCluster.
+	rules := []rbacv1.PolicyRule{
+		{APIGroups: []string{"vibecluster.dev"}, Resources: []string{"virtualclusters"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"}},
+		{APIGroups: []string{"vibecluster.dev"}, Resources: []string{"virtualclusters/status"}, Verbs: []string{"get", "update", "patch"}},
+		{APIGroups: []string{"vibecluster.dev"}, Resources: []string{"virtualclusters/finalizers"}, Verbs: []string{"update"}},
+		{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
+		{APIGroups: []string{""}, Resources: []string{"serviceaccounts"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
+		{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
+		{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
+		{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"ingresses"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"}},
+		// RBAC management: the operator creates per-vcluster (Cluster)Roles and
+		// (Cluster)RoleBindings. `bind` and `escalate` are required because the
+		// per-namespace Role grants `*` on `*`, which is a superset of every
+		// permission in the cluster — Kubernetes blocks granting permissions you
+		// do not yourself hold unless you have escalate/bind on the target.
+		{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"clusterroles", "clusterrolebindings"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete", "bind", "escalate"}},
+		{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"roles", "rolebindings"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete", "bind", "escalate"}},
+		{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
+		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"}},
+	}
+	// Mirror the per-vcluster syncer permissions onto the operator's own
+	// ClusterRole. Without this, Kubernetes' privilege-escalation check rejects
+	// the operator when it tries to create the per-vcluster syncer ClusterRole
+	// (a subject cannot grant permissions it does not itself hold).
+	rules = append(rules, SyncerClusterRoleRules()...)
+
 	cr := &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   OperatorName,
 			Labels: labels,
 		},
-		Rules: []rbacv1.PolicyRule{
-			{APIGroups: []string{"vibecluster.dev"}, Resources: []string{"virtualclusters"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"}},
-			{APIGroups: []string{"vibecluster.dev"}, Resources: []string{"virtualclusters/status"}, Verbs: []string{"get", "update", "patch"}},
-			{APIGroups: []string{"vibecluster.dev"}, Resources: []string{"virtualclusters/finalizers"}, Verbs: []string{"update"}},
-			{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
-			{APIGroups: []string{""}, Resources: []string{"serviceaccounts"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
-			{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
-			{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
-			{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
-			{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"clusterroles", "clusterrolebindings"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
-			{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"roles", "rolebindings"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
-			{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
-			{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"}},
-		},
+		Rules: rules,
 	}
 
-	if _, err := client.RbacV1().ClusterRoles().Get(ctx, OperatorName, metav1.GetOptions{}); errors.IsNotFound(err) {
+	existingCR, err := client.RbacV1().ClusterRoles().Get(ctx, OperatorName, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
 		if _, err := client.RbacV1().ClusterRoles().Create(ctx, cr, metav1.CreateOptions{}); err != nil {
 			return fmt.Errorf("creating ClusterRole: %w", err)
 		}
 	} else if err != nil {
 		return err
+	} else {
+		// Update rules in place so reinstalls / upgrades pick up new permissions.
+		existingCR.Rules = cr.Rules
+		existingCR.Labels = cr.Labels
+		if _, err := client.RbacV1().ClusterRoles().Update(ctx, existingCR, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("updating ClusterRole: %w", err)
+		}
 	}
 
 	crb := &rbacv1.ClusterRoleBinding{
@@ -370,6 +393,21 @@ func buildVirtualClusterCRD() *apiextensionsv1.CustomResourceDefinition {
 										"k3sImage":    {Type: "string", Default: jsonRaw(`"rancher/k3s:v1.28.5-k3s1"`)},
 										"syncerImage": {Type: "string", Default: jsonRaw(`"ghcr.io/eatsoup/vibecluster/syncer:latest"`)},
 										"storage":     {Type: "string", Default: jsonRaw(`"5Gi"`)},
+										"expose": {
+											Type:     "object",
+											Required: []string{"type"},
+											Properties: map[string]apiextensionsv1.JSONSchemaProps{
+												"type": {
+													Type: "string",
+													Enum: []apiextensionsv1.JSON{
+														{Raw: []byte(`"LoadBalancer"`)},
+														{Raw: []byte(`"Ingress"`)},
+													},
+												},
+												"host":         {Type: "string"},
+												"ingressClass": {Type: "string"},
+											},
+										},
 									},
 								},
 								"status": {
