@@ -2,17 +2,21 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/eatsoup/vibecluster/pkg/k8s"
+	"github.com/eatsoup/vibecluster/pkg/kubeconfig"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type exposeOptions struct {
-	exposeType   string
-	ingressClass string
-	host         string
+	exposeType    string
+	ingressClass  string
+	host          string
+	temp          bool
+	kubeconfigOut string
 }
 
 func newExposeCommand() *cobra.Command {
@@ -20,7 +24,7 @@ func newExposeCommand() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "expose NAME",
-		Short: "Expose a virtual cluster via LoadBalancer or Ingress",
+		Short: "Expose a virtual cluster via LoadBalancer, Ingress, or an ephemeral port-forward",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runExpose(args[0], opts)
@@ -30,12 +34,68 @@ func newExposeCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.exposeType, "type", "", "exposure type for the cluster (LoadBalancer, Ingress)")
 	cmd.Flags().StringVar(&opts.ingressClass, "ingress-class", "", "ingress class if expose is Ingress")
 	cmd.Flags().StringVar(&opts.host, "host", "", "ingress hostname if expose is Ingress")
-	_ = cmd.MarkFlagRequired("type")
+	cmd.Flags().BoolVar(&opts.temp, "temp", false, "start an ephemeral port-forward to the virtual cluster API and block until Ctrl+C")
+	cmd.Flags().StringVar(&opts.kubeconfigOut, "kubeconfig", "", "with --temp, write a kubeconfig pointing at the local port-forward to this file (default: ./vibecluster-<name>.kubeconfig)")
 
 	return cmd
 }
 
 func runExpose(name string, opts *exposeOptions) error {
+	if opts.temp && opts.exposeType != "" {
+		return fmt.Errorf("--temp and --type are mutually exclusive")
+	}
+	if !opts.temp && opts.exposeType == "" {
+		return fmt.Errorf("either --type or --temp must be specified")
+	}
+	if opts.temp {
+		return runExposeTemp(name, opts)
+	}
+	return runExposePersistent(name, opts)
+}
+
+func runExposeTemp(name string, opts *exposeOptions) error {
+	client, restConfig, err := k8s.NewClient(kubeContext)
+	if err != nil {
+		return err
+	}
+
+	ctx := cmd_context()
+	ns := k8s.NamespaceName(name)
+	podName := name + "-0"
+
+	fmt.Fprintf(os.Stderr, "Setting up port-forward to %s/%s...\n", ns, podName)
+	localPort, stopCh, err := k8s.PortForward(ctx, client, restConfig, ns, podName, k8s.K3sPort)
+	if err != nil {
+		return fmt.Errorf("port-forward: %w", err)
+	}
+	defer close(stopCh)
+
+	server := fmt.Sprintf("https://127.0.0.1:%d", localPort)
+
+	fmt.Fprintln(os.Stderr, "Retrieving kubeconfig...")
+	config, err := kubeconfig.Retrieve(ctx, client, restConfig, name, server)
+	if err != nil {
+		return fmt.Errorf("retrieving kubeconfig: %w", err)
+	}
+
+	outPath := opts.kubeconfigOut
+	if outPath == "" {
+		outPath = fmt.Sprintf("./vibecluster-%s.kubeconfig", name)
+	}
+	if err := kubeconfig.WriteToFile(config, outPath); err != nil {
+		return fmt.Errorf("writing kubeconfig: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "Kubeconfig written to %s\n", outPath)
+	fmt.Fprintf(os.Stderr, "Port-forward running on 127.0.0.1:%d. Press Ctrl+C to stop.\n", localPort)
+	fmt.Fprintf(os.Stderr, "  export KUBECONFIG=%s\n", outPath)
+
+	<-ctx.Done()
+	fmt.Fprintln(os.Stderr, "Stopping port-forward.")
+	return nil
+}
+
+func runExposePersistent(name string, opts *exposeOptions) error {
 	client, _, err := k8s.NewClient(kubeContext)
 	if err != nil {
 		return err

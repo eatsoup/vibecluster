@@ -76,54 +76,44 @@ func runCreate(name string, opts *createOptions) error {
 
 	fmt.Println("Virtual cluster is ready!")
 
-	if opts.connect {
-		ns := k8s.NamespaceName(name)
-		podName := name + "-0"
-
-		fmt.Println("Setting up port-forward...")
-		localPort, stopCh, err := k8s.PortForward(ctx, client, restConfig, ns, podName, k8s.K3sPort)
-		if err != nil {
-			return fmt.Errorf("port-forward: %w", err)
-		}
-
-		server := fmt.Sprintf("https://127.0.0.1:%d", localPort)
-
-		fmt.Println("Retrieving kubeconfig...")
-		config, err := kubeconfig.Retrieve(ctx, client, restConfig, name, server)
-		if err != nil {
-			close(stopCh)
-			return fmt.Errorf("retrieving kubeconfig: %w", err)
-		}
-
-		if opts.print {
-			close(stopCh)
-			return kubeconfig.Print(config)
-		}
-
-		outPath := opts.kubeconfigOut
-		if outPath == "" && !opts.updateKubeconfig {
-			outPath = fmt.Sprintf("./vibecluster-%s.kubeconfig", name)
-		}
-
-		if err := kubeconfig.WriteToFile(config, outPath); err != nil {
-			close(stopCh)
-			return fmt.Errorf("writing kubeconfig: %w", err)
-		}
-
-		contextName := "vibecluster-" + name
-		if opts.updateKubeconfig {
-			fmt.Printf("Kubeconfig updated in default location. Current context set to %q\n", contextName)
-		} else {
-			fmt.Printf("Kubeconfig written to %s\n", outPath)
-			fmt.Printf("To use: export KUBECONFIG=%s\n", outPath)
-		}
-		
-		fmt.Printf("Port-forward running on port %d. Press Ctrl+C to stop.\n", localPort)
-		fmt.Printf("\nTo see nodes: kubectl get nodes\n")
-
-		<-ctx.Done()
-		close(stopCh)
+	if !opts.connect {
+		return nil
 	}
+
+	// Retrieve kubeconfig without standing up a port-forward.
+	// kubeconfig.Retrieve uses the host apiserver for `exec`, so no port-forward is required.
+	// The server URL falls back to the in-cluster service address; use `vibecluster expose --temp`
+	// or `--expose <type>` to make the API reachable from outside the cluster.
+	fmt.Println("Retrieving kubeconfig...")
+	config, err := kubeconfig.Retrieve(ctx, client, restConfig, name, "")
+	if err != nil {
+		return fmt.Errorf("retrieving kubeconfig: %w", err)
+	}
+
+	if opts.print {
+		return kubeconfig.Print(config)
+	}
+
+	outPath := opts.kubeconfigOut
+	if outPath == "" && !opts.updateKubeconfig {
+		outPath = fmt.Sprintf("./vibecluster-%s.kubeconfig", name)
+	}
+
+	if err := kubeconfig.WriteToFile(config, outPath); err != nil {
+		return fmt.Errorf("writing kubeconfig: %w", err)
+	}
+
+	contextName := "vibecluster-" + name
+	if opts.updateKubeconfig {
+		fmt.Printf("Kubeconfig updated in default location. Current context set to %q\n", contextName)
+	} else {
+		fmt.Printf("Kubeconfig written to %s\n", outPath)
+		fmt.Printf("To use: export KUBECONFIG=%s\n", outPath)
+	}
+
+	fmt.Println("\nThe kubeconfig points to the in-cluster service URL. To reach the cluster from your machine:")
+	fmt.Printf("  vibecluster expose %s --temp                # ephemeral port-forward\n", name)
+	fmt.Printf("  vibecluster expose %s --type LoadBalancer   # persistent external IP\n", name)
 
 	return nil
 }
