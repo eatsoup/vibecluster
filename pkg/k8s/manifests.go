@@ -598,3 +598,89 @@ func WaitForReady(ctx context.Context, client kubernetes.Interface, name string,
 
 	return fmt.Errorf("timeout waiting for virtual cluster %s to become ready", name)
 }
+
+// ExternalAddress describes how a virtual cluster's API can be reached from outside the host cluster.
+type ExternalAddress struct {
+	// Host is the hostname or IP to connect to.
+	Host string
+	// Port is the TCP port to connect to.
+	Port int32
+	// Source describes where the address came from ("LoadBalancer", "Ingress", or "" if none).
+	Source string
+	// CertVerifies is true when the address is expected to match a SAN in the k3s server cert.
+	// When false, callers should set InsecureSkipTLSVerify on generated kubeconfigs.
+	CertVerifies bool
+}
+
+// URL returns the https URL for connecting to the API server.
+func (a ExternalAddress) URL() string {
+	if a.Host == "" {
+		return ""
+	}
+	if a.Port == 0 || a.Port == 443 {
+		return fmt.Sprintf("https://%s", a.Host)
+	}
+	return fmt.Sprintf("https://%s:%d", a.Host, a.Port)
+}
+
+// GetExternalAddress returns the externally-reachable address for a virtual cluster, if any.
+// For LoadBalancer services it reads svc.Status.LoadBalancer.Ingress.
+// For Ingress exposure it reads the Ingress rule host.
+// Returns an empty ExternalAddress (zero Host) if the cluster is not exposed externally.
+func GetExternalAddress(ctx context.Context, client kubernetes.Interface, name string) (ExternalAddress, error) {
+	ns := NamespaceName(name)
+
+	svc, err := client.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return ExternalAddress{}, fmt.Errorf("getting service: %w", err)
+	}
+
+	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer {
+		for _, ing := range svc.Status.LoadBalancer.Ingress {
+			host := ing.Hostname
+			if host == "" {
+				host = ing.IP
+			}
+			if host != "" {
+				// LB IPs/hostnames are not in the k3s cert SAN by default — connections
+				// must skip TLS verification unless the user added the address to TLS-SANs.
+				return ExternalAddress{Host: host, Port: ServicePort, Source: "LoadBalancer", CertVerifies: false}, nil
+			}
+		}
+		return ExternalAddress{Source: "LoadBalancer"}, nil
+	}
+
+	ing, err := client.NetworkingV1().Ingresses(ns).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		for _, rule := range ing.Spec.Rules {
+			if rule.Host != "" {
+				// Ingress hosts are added to TLS-SAN at create/expose time, so the cert validates.
+				return ExternalAddress{Host: rule.Host, Port: 443, Source: "Ingress", CertVerifies: true}, nil
+			}
+		}
+	} else if !errors.IsNotFound(err) {
+		return ExternalAddress{}, fmt.Errorf("getting ingress: %w", err)
+	}
+
+	return ExternalAddress{}, nil
+}
+
+// WaitForExternalAddress polls until GetExternalAddress returns a non-empty Host or the timeout elapses.
+func WaitForExternalAddress(ctx context.Context, client kubernetes.Interface, name string, timeout time.Duration) (ExternalAddress, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		addr, err := GetExternalAddress(ctx, client, name)
+		if err != nil {
+			return ExternalAddress{}, err
+		}
+		if addr.Host != "" {
+			return addr, nil
+		}
+		select {
+		case <-ctx.Done():
+			return ExternalAddress{}, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return ExternalAddress{}, fmt.Errorf("timeout waiting for external address for %s", name)
+}

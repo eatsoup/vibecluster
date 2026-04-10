@@ -80,12 +80,23 @@ func runCreate(name string, opts *createOptions) error {
 		return nil
 	}
 
+	// If --expose was set, wait for the external address and point the kubeconfig at it.
+	retrieveOpts := kubeconfig.RetrieveOptions{}
+	if opts.exposeType != "" {
+		fmt.Printf("Waiting for %s address (timeout: %s)...\n", opts.exposeType, opts.timeout)
+		addr, waitErr := k8s.WaitForExternalAddress(ctx, client, name, opts.timeout)
+		if waitErr != nil {
+			return fmt.Errorf("waiting for external address: %w", waitErr)
+		}
+		retrieveOpts.Server = addr.URL()
+		retrieveOpts.InsecureSkipTLSVerify = !addr.CertVerifies
+		fmt.Printf("External address: %s\n", retrieveOpts.Server)
+	}
+
 	// Retrieve kubeconfig without standing up a port-forward.
-	// kubeconfig.Retrieve uses the host apiserver for `exec`, so no port-forward is required.
-	// The server URL falls back to the in-cluster service address; use `vibecluster expose --temp`
-	// or `--expose <type>` to make the API reachable from outside the cluster.
+	// RetrieveWithOptions uses the host apiserver for `exec`, so no port-forward is required.
 	fmt.Println("Retrieving kubeconfig...")
-	config, err := kubeconfig.Retrieve(ctx, client, restConfig, name, "")
+	config, err := kubeconfig.RetrieveWithOptions(ctx, client, restConfig, name, retrieveOpts)
 	if err != nil {
 		return fmt.Errorf("retrieving kubeconfig: %w", err)
 	}
@@ -111,9 +122,11 @@ func runCreate(name string, opts *createOptions) error {
 		fmt.Printf("To use: export KUBECONFIG=%s\n", outPath)
 	}
 
-	fmt.Println("\nThe kubeconfig points to the in-cluster service URL. To reach the cluster from your machine:")
-	fmt.Printf("  vibecluster expose %s --temp                # ephemeral port-forward\n", name)
-	fmt.Printf("  vibecluster expose %s --type LoadBalancer   # persistent external IP\n", name)
+	if opts.exposeType == "" {
+		fmt.Println("\nThe kubeconfig points to the in-cluster service URL. To reach the cluster from your machine:")
+		fmt.Printf("  vibecluster expose %s --temp                # ephemeral port-forward\n", name)
+		fmt.Printf("  vibecluster expose %s --type LoadBalancer   # persistent external IP\n", name)
+	}
 
 	return nil
 }
