@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -49,7 +50,7 @@ func (s *Syncer) Run(ctx context.Context) error {
 	fmt.Printf("  Syncing: pods, services, configmaps, secrets\n")
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 6)
 
 	syncFuncs := []struct {
 		name string
@@ -79,6 +80,17 @@ func (s *Syncer) Run(ctx context.Context) error {
 		fmt.Printf("  Starting nodes syncer (host -> virtual)\n")
 		if err := s.syncNodes(ctx); err != nil && ctx.Err() == nil {
 			errCh <- fmt.Errorf("nodes syncer: %w", err)
+		}
+	}()
+
+	// Watch host pods so we can reflect their status (and bind nodeName)
+	// back into the virtual cluster.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fmt.Printf("  Starting host pods syncer (host -> virtual status)\n")
+		if err := s.syncHostPods(ctx); err != nil && ctx.Err() == nil {
+			errCh <- fmt.Errorf("host pods syncer: %w", err)
 		}
 	}()
 
@@ -247,7 +259,7 @@ func (s *Syncer) syncPodToHost(ctx context.Context, vPod *corev1.Pod) error {
 		hostPod.Spec.Containers[i].VolumeMounts = mounts
 	}
 
-	existing, err := s.hostClient.CoreV1().Pods(s.hostNS).Get(ctx, hostName, metav1.GetOptions{})
+	_, err := s.hostClient.CoreV1().Pods(s.hostNS).Get(ctx, hostName, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		_, err = s.hostClient.CoreV1().Pods(s.hostNS).Create(ctx, hostPod, metav1.CreateOptions{})
 		if err != nil {
@@ -259,20 +271,103 @@ func (s *Syncer) syncPodToHost(ctx context.Context, vPod *corev1.Pod) error {
 		return err
 	}
 
-	// Pod exists - sync status back to virtual cluster
-	return s.syncPodStatusToVirtual(ctx, existing, vPod)
+	// Pod already exists on the host. Status updates are driven by the
+	// host-pod watcher (syncHostPods); nothing to do here.
+	return nil
 }
 
-func (s *Syncer) syncPodStatusToVirtual(ctx context.Context, hostPod *corev1.Pod, vPod *corev1.Pod) error {
-	if hostPod.Status.Phase == vPod.Status.Phase {
+// syncHostPods watches synced pods on the host cluster and reflects their
+// status (Phase, Conditions, IPs, ContainerStatuses) back into the virtual
+// cluster. It also issues a Bind on the virtual pod once the host pod has
+// been scheduled, so that kubectl logs/exec/port-forward — which require
+// .spec.nodeName — start working.
+func (s *Syncer) syncHostPods(ctx context.Context) error {
+	selector := fmt.Sprintf("%s=%s", LabelSyncedFrom, s.name)
+	return watchWithRetry(ctx, "host-pods", func(ctx context.Context) error {
+		watcher, err := s.hostClient.CoreV1().Pods(s.hostNS).Watch(ctx, metav1.ListOptions{
+			LabelSelector: selector,
+		})
+		if err != nil {
+			return fmt.Errorf("watching host pods: %w", err)
+		}
+		defer watcher.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case event, ok := <-watcher.ResultChan():
+				if !ok {
+					return fmt.Errorf("watch channel closed")
+				}
+				hostPod, ok := event.Object.(*corev1.Pod)
+				if !ok {
+					continue
+				}
+				switch event.Type {
+				case watch.Added, watch.Modified:
+					if err := s.reconcileVirtualPodFromHost(ctx, hostPod); err != nil {
+						fmt.Printf("  [host-pods] reconcile error for %s: %v\n", hostPod.Name, err)
+					}
+				}
+			}
+		}
+	})
+}
+
+// reconcileVirtualPodFromHost copies the host pod's status onto the matching
+// virtual pod, and binds the virtual pod to its host node if not yet bound.
+func (s *Syncer) reconcileVirtualPodFromHost(ctx context.Context, hostPod *corev1.Pod) error {
+	vName := hostPod.Labels[LabelVirtualName]
+	vNamespace := hostPod.Labels[LabelVirtualNamespace]
+	if vName == "" || vNamespace == "" {
 		return nil
 	}
 
-	vPod = vPod.DeepCopy()
-	vPod.Status = hostPod.Status
+	vPod, err := s.vClient.CoreV1().Pods(vNamespace).Get(ctx, vName, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		// Virtual pod is gone (likely being deleted); the virtual-side
+		// watcher will handle deletion of the host pod.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("getting virtual pod: %w", err)
+	}
 
-	_, err := s.vClient.CoreV1().Pods(vPod.Namespace).UpdateStatus(ctx, vPod, metav1.UpdateOptions{})
-	if err != nil && !errors.IsConflict(err) {
+	// 1. Bind the virtual pod to a node if it isn't yet, so kubectl
+	//    logs/exec stop returning "pod does not have a host assigned".
+	if vPod.Spec.NodeName == "" && hostPod.Spec.NodeName != "" {
+		binding := &corev1.Binding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vPod.Name,
+				Namespace: vPod.Namespace,
+			},
+			Target: corev1.ObjectReference{
+				Kind: "Node",
+				Name: hostPod.Spec.NodeName,
+			},
+		}
+		if err := s.vClient.CoreV1().Pods(vPod.Namespace).Bind(ctx, binding, metav1.CreateOptions{}); err != nil && !errors.IsConflict(err) && !errors.IsAlreadyExists(err) {
+			return fmt.Errorf("binding virtual pod: %w", err)
+		}
+
+		// Re-fetch so the status update below uses the latest resourceVersion.
+		vPod, err = s.vClient.CoreV1().Pods(vNamespace).Get(ctx, vName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("re-getting virtual pod after bind: %w", err)
+		}
+	}
+
+	// 2. Copy host pod status onto the virtual pod when it differs.
+	if reflect.DeepEqual(vPod.Status, hostPod.Status) {
+		return nil
+	}
+	vPod.Status = *hostPod.Status.DeepCopy()
+	if _, err := s.vClient.CoreV1().Pods(vPod.Namespace).UpdateStatus(ctx, vPod, metav1.UpdateOptions{}); err != nil {
+		if errors.IsConflict(err) {
+			// Will be retried on the next watch event.
+			return nil
+		}
 		return fmt.Errorf("updating virtual pod status: %w", err)
 	}
 	return nil
