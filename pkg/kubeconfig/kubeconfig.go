@@ -20,7 +20,25 @@ import (
 )
 
 // Retrieve fetches the kubeconfig from the k3s pod and rewrites the server URL.
+// If serverOverride is empty, the in-cluster service URL is used.
 func Retrieve(ctx context.Context, client *kubernetes.Clientset, restConfig *rest.Config, name string, serverOverride string) (*clientcmdapi.Config, error) {
+	return RetrieveWithOptions(ctx, client, restConfig, name, RetrieveOptions{Server: serverOverride})
+}
+
+// RetrieveOptions controls how the kubeconfig is built.
+type RetrieveOptions struct {
+	// Server overrides the API server URL written to the kubeconfig.
+	// If empty, the in-cluster service URL is used.
+	Server string
+	// InsecureSkipTLSVerify, when true, sets InsecureSkipTLSVerify on the cluster
+	// entry and clears the embedded CA. Use this when Server is an address that
+	// does not appear in the k3s server certificate's SAN list (e.g. a fresh
+	// LoadBalancer IP).
+	InsecureSkipTLSVerify bool
+}
+
+// RetrieveWithOptions fetches the kubeconfig from the k3s pod with full control over the result.
+func RetrieveWithOptions(ctx context.Context, client *kubernetes.Clientset, restConfig *rest.Config, name string, opts RetrieveOptions) (*clientcmdapi.Config, error) {
 	ns := k8s.NamespaceName(name)
 	podName := name + "-0" // StatefulSet pod naming
 
@@ -44,7 +62,7 @@ func Retrieve(ctx context.Context, client *kubernetes.Clientset, restConfig *res
 	}
 
 	// Determine server address
-	server := serverOverride
+	server := opts.Server
 	if server == "" {
 		server = fmt.Sprintf("https://%s.%s.svc.cluster.local:%d", name, ns, k8s.ServicePort)
 	}
@@ -56,10 +74,15 @@ func Retrieve(ctx context.Context, client *kubernetes.Clientset, restConfig *res
 	userName := "vibecluster-" + name
 	contextName := "vibecluster-" + name
 
-	newConfig.Clusters[clusterName] = &clientcmdapi.Cluster{
-		Server:                   server,
-		CertificateAuthorityData: caData,
+	cluster := &clientcmdapi.Cluster{
+		Server: server,
 	}
+	if opts.InsecureSkipTLSVerify {
+		cluster.InsecureSkipTLSVerify = true
+	} else {
+		cluster.CertificateAuthorityData = caData
+	}
+	newConfig.Clusters[clusterName] = cluster
 
 	newConfig.AuthInfos[userName] = &clientcmdapi.AuthInfo{
 		ClientCertificateData: clientCert,
