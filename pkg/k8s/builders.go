@@ -280,7 +280,11 @@ func BuildStatefulSet(opts BuilderOptions) *appsv1.StatefulSet {
 							},
 							Args: []string{
 								"server",
-								"--disable=traefik,servicelb,metrics-server,local-storage",
+								// coredns is disabled because the virtual cluster has no kubelet
+								// (--disable-agent) and no CNI (--flannel-backend=none), so the
+								// coredns Deployment k3s ships would never schedule. The syncer
+								// skips kube-system and cannot translate it. See issue #5.
+								"--disable=traefik,servicelb,metrics-server,local-storage,coredns",
 								"--disable-agent",
 								"--disable-cloud-controller",
 								"--disable-network-policy",

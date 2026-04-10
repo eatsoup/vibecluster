@@ -424,6 +424,73 @@ func TestWaitForReady_AlreadyReady(t *testing.T) {
 	}
 }
 
+func TestK3sDisablesCoreDNS(t *testing.T) {
+	// Issue #5: coredns must be in the --disable list because the virtual cluster
+	// has no kubelet (--disable-agent) and no CNI (--flannel-backend=none), so the
+	// coredns Deployment would never schedule, and the syncer skips kube-system.
+	client := fake.NewSimpleClientset()
+	ctx := context.Background()
+
+	if err := CreateVirtualCluster(ctx, client, "dnstest", CreateOptions{}); err != nil {
+		t.Fatalf("CreateVirtualCluster failed: %v", err)
+	}
+
+	sts, err := client.AppsV1().StatefulSets("vc-dnstest").Get(ctx, "dnstest", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("statefulset not created: %v", err)
+	}
+
+	k3sArgs := sts.Spec.Template.Spec.Containers[0].Args
+	found := false
+	for _, arg := range k3sArgs {
+		if len(arg) > len("--disable=") && arg[:len("--disable=")] == "--disable=" {
+			// arg looks like "--disable=traefik,servicelb,...,coredns"
+			list := arg[len("--disable="):]
+			for _, comp := range splitCSV(list) {
+				if comp == "coredns" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Errorf("k3s args missing coredns in --disable list; args=%v", k3sArgs)
+	}
+}
+
+// TestBuildStatefulSetDisablesCoreDNS covers the operator/builder path.
+func TestBuildStatefulSetDisablesCoreDNS(t *testing.T) {
+	sts := BuildStatefulSet(DefaultBuilderOptions("dnstest"))
+	k3sArgs := sts.Spec.Template.Spec.Containers[0].Args
+	found := false
+	for _, arg := range k3sArgs {
+		if len(arg) > len("--disable=") && arg[:len("--disable=")] == "--disable=" {
+			list := arg[len("--disable="):]
+			for _, comp := range splitCSV(list) {
+				if comp == "coredns" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Errorf("BuildStatefulSet k3s args missing coredns in --disable list; args=%v", k3sArgs)
+	}
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == ',' {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
+
 func TestK3sTLSSANs(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	ctx := context.Background()
