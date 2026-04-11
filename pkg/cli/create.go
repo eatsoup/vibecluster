@@ -24,6 +24,10 @@ type createOptions struct {
 	exposeHost         string
 	mode               string
 	crNamespace        string
+	cpu                string
+	memory             string
+	storage            string
+	pods               int32
 }
 
 func newCreateCommand() *cobra.Command {
@@ -50,8 +54,26 @@ func newCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.exposeHost, "expose-host", "", "ingress hostname if expose is Ingress")
 	cmd.Flags().StringVar(&opts.mode, "mode", "auto", "creation mode: auto (use operator if available), legacy (raw manifests), or operator (require CRD)")
 	cmd.Flags().StringVar(&opts.crNamespace, "cr-namespace", k8s.DefaultCROperatorNamespace, "namespace to create the VirtualCluster CR in (operator mode only)")
+	cmd.Flags().StringVar(&opts.cpu, "cpu", "", "CPU budget for the virtual cluster (e.g. 4, 500m); enforced via a namespace ResourceQuota. Includes the k3s control plane.")
+	cmd.Flags().StringVar(&opts.memory, "memory", "", "memory budget for the virtual cluster (e.g. 8Gi); enforced via a namespace ResourceQuota. Includes the k3s control plane.")
+	cmd.Flags().StringVar(&opts.storage, "storage", "", "total persistent storage budget across all PVCs (e.g. 50Gi); enforced via a namespace ResourceQuota.")
+	cmd.Flags().Int32Var(&opts.pods, "pods", 0, "maximum pod count in the virtual cluster (0 = unlimited).")
 
 	return cmd
+}
+
+// resourceLimitsFromOpts builds the per-vcluster resource budget from CLI
+// flags, returning nil when none of them were set.
+func resourceLimitsFromOpts(opts *createOptions) *k8s.ResourceLimits {
+	if opts.cpu == "" && opts.memory == "" && opts.storage == "" && opts.pods == 0 {
+		return nil
+	}
+	return &k8s.ResourceLimits{
+		CPU:     opts.cpu,
+		Memory:  opts.memory,
+		Storage: opts.storage,
+		Pods:    opts.pods,
+	}
 }
 
 func runCreate(name string, opts *createOptions) error {
@@ -84,6 +106,9 @@ func runCreate(name string, opts *createOptions) error {
 		} else if opts.exposeHost != "" || opts.exposeIngressClass != "" {
 			return fmt.Errorf("--expose-host/--expose-ingress-class require --expose=Ingress or --expose=LoadBalancer")
 		}
+		if rl := resourceLimitsFromOpts(opts); rl != nil {
+			spec.Resources = rl
+		}
 		if err := k8s.CreateVirtualClusterCR(ctx, restConfig, name, opts.crNamespace, spec); err != nil {
 			return fmt.Errorf("creating VirtualCluster CR: %w", err)
 		}
@@ -97,6 +122,7 @@ func runCreate(name string, opts *createOptions) error {
 		ExposeType:         opts.exposeType,
 		ExposeIngressClass: opts.exposeIngressClass,
 		ExposeHost:         opts.exposeHost,
+		Resources:          resourceLimitsFromOpts(opts),
 	}
 
 	fmt.Printf("Creating virtual cluster %q...\n", name)

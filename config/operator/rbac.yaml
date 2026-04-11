@@ -37,6 +37,15 @@ rules:
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
 
+  # ResourceQuota / LimitRange management — used to enforce spec.resources
+  # on the per-vcluster namespace.
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["limitranges"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
   # StatefulSet management
   - apiGroups: ["apps"]
     resources: ["statefulsets"]

@@ -81,6 +81,24 @@ spec:
                     ingressClass:
                       description: IngressClass is the IngressClassName to use when type is Ingress.
                       type: string
+                resources:
+                  description: Resources caps the total resources the virtual cluster can consume on the host. The k3s control plane's own usage counts against these caps.
+                  type: object
+                  properties:
+                    cpu:
+                      description: CPU is the total CPU budget (e.g. "4", "500m"). Enforced as both requests.cpu and limits.cpu.
+                      type: string
+                    memory:
+                      description: Memory is the total memory budget (e.g. "8Gi"). Enforced as both requests.memory and limits.memory.
+                      type: string
+                    storage:
+                      description: Storage is the total persistent storage budget across all PVCs (e.g. "50Gi"). Enforced as requests.storage.
+                      type: string
+                    pods:
+                      description: Pods caps the maximum number of pods that can run in the namespace.
+                      type: integer
+                      format: int32
+                      minimum: 0
             status:
               description: VirtualClusterStatus defines the observed state of a VirtualCluster.
               type: object

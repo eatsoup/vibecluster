@@ -38,6 +38,8 @@ type VirtualClusterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=limitranges,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;delete;bind;escalate
@@ -83,6 +85,14 @@ func (r *VirtualClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// 1. Ensure namespace
 	if err := r.ensureNamespace(ctx, opts); err != nil {
 		return r.updateStatus(ctx, &vc, vibeclusterv1alpha1.VirtualClusterPhaseFailed, false, fmt.Sprintf("Failed to create namespace: %v", err), opts.Namespace)
+	}
+
+	// 1a. Ensure ResourceQuota + LimitRange. These must exist *before* the
+	//     StatefulSet so the LimitRange's defaults apply at admission time
+	//     for the k3s/syncer pods — without that, the quota would reject
+	//     them for having no requests/limits set on every container.
+	if err := r.ensureResourceLimits(ctx, opts); err != nil {
+		return r.updateStatus(ctx, &vc, vibeclusterv1alpha1.VirtualClusterPhaseFailed, false, fmt.Sprintf("Failed to apply resource limits: %v", err), opts.Namespace)
 	}
 
 	// 2. Ensure service account
@@ -141,6 +151,14 @@ func (r *VirtualClusterReconciler) buildOptions(vc *vibeclusterv1alpha1.VirtualC
 		opts.ExposeType = string(vc.Spec.Expose.Type)
 		opts.ExposeHost = vc.Spec.Expose.Host
 		opts.ExposeIngressClass = vc.Spec.Expose.IngressClass
+	}
+	if vc.Spec.Resources != nil {
+		opts.Resources = &k8s.ResourceLimits{
+			CPU:     vc.Spec.Resources.CPU,
+			Memory:  vc.Spec.Resources.Memory,
+			Storage: vc.Spec.Resources.Storage,
+			Pods:    vc.Spec.Resources.Pods,
+		}
 	}
 
 	return opts
@@ -210,6 +228,66 @@ func (r *VirtualClusterReconciler) ensureNamespace(ctx context.Context, opts k8s
 		return r.Create(ctx, ns)
 	}
 	return err
+}
+
+// ensureResourceLimits creates or updates the per-vcluster ResourceQuota and
+// LimitRange when opts.Resources is set, and removes them when it isn't (so
+// clearing spec.resources actually relaxes the budget).
+func (r *VirtualClusterReconciler) ensureResourceLimits(ctx context.Context, opts k8s.BuilderOptions) error {
+	desiredQuota := k8s.BuildResourceQuota(opts)
+	desiredLR := k8s.BuildLimitRange(opts)
+
+	// ResourceQuota
+	existingQuota := &corev1.ResourceQuota{}
+	err := r.Get(ctx, types.NamespacedName{Name: k8s.ResourceQuotaName(opts.Name), Namespace: opts.Namespace}, existingQuota)
+	switch {
+	case errors.IsNotFound(err):
+		if desiredQuota != nil {
+			if err := r.Create(ctx, desiredQuota); err != nil {
+				return fmt.Errorf("creating ResourceQuota: %w", err)
+			}
+		}
+	case err != nil:
+		return err
+	default:
+		if desiredQuota == nil {
+			if err := r.Delete(ctx, existingQuota); err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("deleting stale ResourceQuota: %w", err)
+			}
+		} else {
+			existingQuota.Spec = desiredQuota.Spec
+			if err := r.Update(ctx, existingQuota); err != nil {
+				return fmt.Errorf("updating ResourceQuota: %w", err)
+			}
+		}
+	}
+
+	// LimitRange
+	existingLR := &corev1.LimitRange{}
+	err = r.Get(ctx, types.NamespacedName{Name: k8s.LimitRangeName(opts.Name), Namespace: opts.Namespace}, existingLR)
+	switch {
+	case errors.IsNotFound(err):
+		if desiredLR != nil {
+			if err := r.Create(ctx, desiredLR); err != nil {
+				return fmt.Errorf("creating LimitRange: %w", err)
+			}
+		}
+	case err != nil:
+		return err
+	default:
+		if desiredLR == nil {
+			if err := r.Delete(ctx, existingLR); err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("deleting stale LimitRange: %w", err)
+			}
+		} else {
+			existingLR.Spec = desiredLR.Spec
+			if err := r.Update(ctx, existingLR); err != nil {
+				return fmt.Errorf("updating LimitRange: %w", err)
+			}
+		}
+	}
+
+	return nil
 }
 
 // ensureServiceAccount creates the service account if it doesn't exist.

@@ -54,6 +54,9 @@ type VirtualClusterCRSpec struct {
 	Storage     string
 	// Expose configures external API exposure. nil means in-cluster only.
 	Expose *VirtualClusterCRExpose
+	// Resources caps host resources the virtual cluster can consume. nil
+	// means no quota.
+	Resources *ResourceLimits
 }
 
 // VirtualClusterCRExpose mirrors api/v1alpha1.VirtualClusterExpose for the CLI.
@@ -98,6 +101,25 @@ func createVirtualClusterCRWith(ctx context.Context, dynClient dynamic.Interface
 			exposeMap["ingressClass"] = spec.Expose.IngressClass
 		}
 		specMap["expose"] = exposeMap
+	}
+	if !spec.Resources.IsEmpty() {
+		resMap := map[string]interface{}{}
+		if spec.Resources.CPU != "" {
+			resMap["cpu"] = spec.Resources.CPU
+		}
+		if spec.Resources.Memory != "" {
+			resMap["memory"] = spec.Resources.Memory
+		}
+		if spec.Resources.Storage != "" {
+			resMap["storage"] = spec.Resources.Storage
+		}
+		if spec.Resources.Pods > 0 {
+			// Stored as int64 in unstructured to satisfy the JSON schema's
+			// integer type — int32 also encodes correctly but apimachinery's
+			// validators normalize numerics to int64 internally.
+			resMap["pods"] = int64(spec.Resources.Pods)
+		}
+		specMap["resources"] = resMap
 	}
 
 	obj := &unstructured.Unstructured{
