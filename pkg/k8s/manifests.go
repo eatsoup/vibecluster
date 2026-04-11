@@ -624,8 +624,21 @@ func ListVirtualClusters(ctx context.Context, client kubernetes.Interface) ([]VC
 }
 
 // WaitForReady waits until the virtual cluster pod is ready.
+//
+// If the virtual cluster's namespace does not exist at all, this returns
+// immediately with a NotFound error rather than spending the full timeout
+// polling — see issue #19 (a typoed cluster name shouldn't take 30s to fail).
 func WaitForReady(ctx context.Context, client kubernetes.Interface, name string, timeout time.Duration) error {
 	ns := NamespaceName(name)
+
+	// Fast-fail: if neither the namespace nor the StatefulSet exist, the
+	// cluster simply doesn't exist. Return a clear NotFound immediately.
+	if _, err := client.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{}); errors.IsNotFound(err) {
+		return fmt.Errorf("virtual cluster %q not found (no namespace %s)", name, ns)
+	} else if err != nil {
+		return fmt.Errorf("checking namespace %s: %w", ns, err)
+	}
+
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {

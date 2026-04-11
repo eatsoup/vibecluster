@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -450,6 +451,9 @@ func TestListVirtualClusters_PendingStatus(t *testing.T) {
 
 func TestWaitForReady_AlreadyReady(t *testing.T) {
 	client := fake.NewSimpleClientset(
+		&corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: "vc-ready"},
+		},
 		&appsv1.StatefulSet{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "ready",
@@ -465,6 +469,29 @@ func TestWaitForReady_AlreadyReady(t *testing.T) {
 	err := WaitForReady(ctx, client, "ready", 5e9)
 	if err != nil {
 		t.Fatalf("WaitForReady failed for already-ready cluster: %v", err)
+	}
+}
+
+// Issue #19: connecting to a cluster name that doesn't exist used to block
+// for the full readiness timeout (~30s) and report a misleading "not ready"
+// error. WaitForReady should now fast-fail with a NotFound error before
+// starting any polling.
+func TestWaitForReady_NonexistentClusterFastFails(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ctx := context.Background()
+
+	start := time.Now()
+	err := WaitForReady(ctx, client, "nope", 30*time.Second)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error for nonexistent cluster, got nil")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("WaitForReady took %v, expected fast-fail (well under the 30s timeout)", elapsed)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error %q does not mention 'not found'", err.Error())
 	}
 }
 
