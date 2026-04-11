@@ -494,6 +494,83 @@ func TestSyncNodeToVirtual(t *testing.T) {
 	}
 }
 
+func TestSyncNodeToVirtual_RewritesAddressesForShim(t *testing.T) {
+	hostClient := fake.NewSimpleClientset()
+	vClient := fake.NewSimpleClientset()
+	s := New("test", hostClient, vClient)
+	s.ShimPodIP = "10.244.1.42"
+	s.ShimPort = 10250
+	ctx := context.Background()
+
+	hostNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-1"},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: "10.0.0.50"},
+				{Type: corev1.NodeHostName, Address: "worker-1"},
+			},
+			DaemonEndpoints: corev1.NodeDaemonEndpoints{
+				KubeletEndpoint: corev1.DaemonEndpoint{Port: 10250},
+			},
+		},
+	}
+
+	if err := s.syncNodeToVirtual(ctx, hostNode); err != nil {
+		t.Fatalf("syncNodeToVirtual: %v", err)
+	}
+
+	vNode, _ := vClient.CoreV1().Nodes().Get(ctx, "worker-1", metav1.GetOptions{})
+	var internalIP string
+	var hostname string
+	for _, a := range vNode.Status.Addresses {
+		switch a.Type {
+		case corev1.NodeInternalIP:
+			internalIP = a.Address
+		case corev1.NodeHostName:
+			hostname = a.Address
+		}
+	}
+	if internalIP != "10.244.1.42" {
+		t.Errorf("InternalIP = %q, want %q", internalIP, "10.244.1.42")
+	}
+	if hostname != "worker-1" {
+		t.Errorf("Hostname = %q, should be left untouched", hostname)
+	}
+	if vNode.Status.DaemonEndpoints.KubeletEndpoint.Port != 10250 {
+		t.Errorf("kubelet port = %d, want 10250", vNode.Status.DaemonEndpoints.KubeletEndpoint.Port)
+	}
+
+	// The host pod sync code path must NOT reflect this rewrite back into
+	// the host: it's purely a virtual-cluster view. Verify the original
+	// hostNode object was not mutated.
+	if hostNode.Status.Addresses[0].Address != "10.0.0.50" {
+		t.Errorf("host node was mutated: addresses[0].Address = %q",
+			hostNode.Status.Addresses[0].Address)
+	}
+}
+
+func TestSyncNodeToVirtual_NoShimLeavesAddressesAlone(t *testing.T) {
+	vClient := fake.NewSimpleClientset()
+	s := New("test", nil, vClient)
+	ctx := context.Background()
+
+	hostNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-1"},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: "10.0.0.50"},
+			},
+		},
+	}
+	if err := s.syncNodeToVirtual(ctx, hostNode); err != nil {
+		t.Fatalf("syncNodeToVirtual: %v", err)
+	}
+	vNode, _ := vClient.CoreV1().Nodes().Get(ctx, "worker-1", metav1.GetOptions{})
+	if vNode.Status.Addresses[0].Address != "10.0.0.50" {
+		t.Errorf("address rewritten without shim configured: %q", vNode.Status.Addresses[0].Address)
+	}
+}
+
 func TestSyncNodeToVirtual_Update(t *testing.T) {
 	vClient := fake.NewSimpleClientset(&corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "worker-1"},

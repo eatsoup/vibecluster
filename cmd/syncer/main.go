@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eatsoup/vibecluster/pkg/k8s"
 	"github.com/eatsoup/vibecluster/pkg/syncer"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -78,6 +79,23 @@ func main() {
 
 	// Start syncing
 	s := syncer.New(name, hostClient, vClient)
+
+	// Configure the kubelet shim. POD_IP is supplied via the downward API
+	// in the StatefulSet template; we use it both as the bind / SAN IP for
+	// the shim's serving cert and as the InternalIP we patch onto every
+	// synced virtual node so the virtual k3s API server forwards
+	// logs/exec/portforward requests to us instead of the real host
+	// kubelet. The k3s data dir is mounted into the syncer container so
+	// the shim can sign its serving cert with the k3s server CA.
+	s.ShimHostConfig = hostConfig
+	s.ShimPodIP = os.Getenv("POD_IP")
+	s.ShimPort = k8s.KubeletShimPort
+	s.ShimCACertPath = "/data/k3s/server/tls/server-ca.crt"
+	s.ShimCAKeyPath = "/data/k3s/server/tls/server-ca.key"
+	if s.ShimPodIP == "" {
+		fmt.Fprintln(os.Stderr, "warning: POD_IP env var is empty; kubelet shim will not be reachable from the virtual k3s API server")
+	}
+
 	if err := s.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Syncer error: %v\n", err)
 		os.Exit(1)
