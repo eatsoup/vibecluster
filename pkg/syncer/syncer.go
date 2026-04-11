@@ -9,11 +9,13 @@ import (
 	"time"
 
 	"github.com/eatsoup/vibecluster/pkg/k8s"
+	"github.com/eatsoup/vibecluster/pkg/syncer/kubeletshim"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -31,6 +33,18 @@ type Syncer struct {
 	hostClient kubernetes.Interface
 	vClient    kubernetes.Interface
 	hostNS     string
+
+	// Optional kubelet shim configuration. When ShimPodIP is non-empty the
+	// syncer (a) starts the kubelet shim during Run and (b) overrides
+	// every synced virtual node's InternalIP and kubeletEndpoint.port to
+	// point at the shim, so logs/exec/portforward go through it instead of
+	// hitting the host kubelet directly. See pkg/syncer/kubeletshim for
+	// the rationale.
+	ShimHostConfig *rest.Config
+	ShimPodIP      string
+	ShimPort       int32
+	ShimCACertPath string
+	ShimCAKeyPath  string
 }
 
 // New creates a new Syncer.
@@ -93,6 +107,33 @@ func (s *Syncer) Run(ctx context.Context) error {
 			errCh <- fmt.Errorf("host pods syncer: %w", err)
 		}
 	}()
+
+	// Start the kubelet shim if configured. This serves the kubelet API
+	// (logs/exec/attach/portforward) on ShimPort and proxies each request
+	// to the matching pod subresource on the host kube-apiserver, after
+	// translating virtual pod (name, namespace) to the host pod name.
+	if s.ShimHostConfig != nil {
+		shim, err := kubeletshim.New(kubeletshim.Config{
+			HostConfig:    s.ShimHostConfig,
+			HostNamespace: s.hostNS,
+			TranslateName: s.HostName,
+			PodIP:         s.ShimPodIP,
+			Port:          int(s.ShimPort),
+			CACertPath:    s.ShimCACertPath,
+			CAKeyPath:     s.ShimCAKeyPath,
+		})
+		if err != nil {
+			return fmt.Errorf("creating kubelet shim: %w", err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fmt.Printf("  Starting kubelet shim on :%d (PodIP=%s)\n", s.ShimPort, s.ShimPodIP)
+			if err := shim.Run(ctx); err != nil && ctx.Err() == nil {
+				errCh <- fmt.Errorf("kubelet shim: %w", err)
+			}
+		}()
+	}
 
 	wg.Wait()
 	close(errCh)
@@ -669,8 +710,9 @@ func (s *Syncer) syncNodeToVirtual(ctx context.Context, hostNode *corev1.Node) e
 			Labels: hostNode.Labels,
 		},
 		Spec:   hostNode.Spec,
-		Status: hostNode.Status,
+		Status: *hostNode.Status.DeepCopy(),
 	}
+	s.rewriteNodeForShim(&vNode.Status)
 
 	existing, err := s.vClient.CoreV1().Nodes().Get(ctx, hostNode.Name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
@@ -684,10 +726,43 @@ func (s *Syncer) syncNodeToVirtual(ctx context.Context, hostNode *corev1.Node) e
 		return err
 	}
 
-	existing.Status = hostNode.Status
+	existing.Status = *hostNode.Status.DeepCopy()
 	existing.Labels = hostNode.Labels
+	s.rewriteNodeForShim(&existing.Status)
 	_, err = s.vClient.CoreV1().Nodes().UpdateStatus(ctx, existing, metav1.UpdateOptions{})
 	return err
+}
+
+// rewriteNodeForShim mutates a node Status so that kubelet API requests sent
+// by the virtual k3s API server land on this syncer's kubelet shim instead of
+// the real host kubelet. The k3s API server is invoked with
+// --kubelet-preferred-address-types=InternalIP, so we only need to swap
+// every InternalIP for the syncer pod IP and update the kubelet port.
+//
+// We *only* rewrite when the syncer is configured with a shim. In test
+// fixtures and in pre-shim setups the node addresses are passed through
+// untouched.
+func (s *Syncer) rewriteNodeForShim(status *corev1.NodeStatus) {
+	if s.ShimPodIP == "" || s.ShimPort == 0 {
+		return
+	}
+	// Replace InternalIPs with the shim address. Keep Hostname / ExternalIP
+	// entries untouched so users still see meaningful info in
+	// `kubectl get node -o wide`.
+	rewrote := false
+	for i := range status.Addresses {
+		if status.Addresses[i].Type == corev1.NodeInternalIP {
+			status.Addresses[i].Address = s.ShimPodIP
+			rewrote = true
+		}
+	}
+	if !rewrote {
+		status.Addresses = append(status.Addresses, corev1.NodeAddress{
+			Type:    corev1.NodeInternalIP,
+			Address: s.ShimPodIP,
+		})
+	}
+	status.DaemonEndpoints.KubeletEndpoint.Port = s.ShimPort
 }
 
 func boolPtr(b bool) *bool {

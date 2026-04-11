@@ -277,7 +277,20 @@ func k3sArgs(opts BuilderOptions) []string {
 		"--disable-network-policy",
 		"--disable-helm-controller",
 		"--flannel-backend=none",
+		// With --disable-agent there is no per-node tunnel for the apiserver
+		// to dial kubelets through, so the default egress-selector mode
+		// ("agent") makes kubectl logs/exec/portforward fail with a 502 the
+		// instant kube-apiserver tries to reach a kubelet. Setting this to
+		// "disabled" makes kube-apiserver dial kubelet addresses (i.e. our
+		// shim) directly via TCP. See issue #21.
+		"--egress-selector-mode=disabled",
 		"--kube-controller-manager-arg=controllers=*,-nodeipam,-nodelifecycle,-persistentvolume-binder,-attachdetach,-persistentvolume-expander,-cloud-node-lifecycle,-ttl",
+		// Force kube-apiserver to dial the kubelet by InternalIP. The
+		// syncer rewrites every synced node's InternalIP to its own pod IP
+		// (where the kubelet shim listens), so this is what makes
+		// logs/exec/portforward route through the shim instead of the real
+		// host kubelet — which doesn't know virtual pod names. See issue #21.
+		"--kube-apiserver-arg=kubelet-preferred-address-types=InternalIP",
 		"--data-dir=/data/k3s",
 		"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc.cluster.local",
 		"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc",
@@ -385,6 +398,30 @@ func BuildStatefulSet(opts BuilderOptions) *appsv1.StatefulSet {
 								{
 									Name:  "VCLUSTER_NAME",
 									Value: opts.Name,
+								},
+								{
+									// POD_IP is needed by the kubelet shim:
+									// it's the bind address, the SAN baked
+									// into its TLS cert, and the value the
+									// syncer patches into every synced
+									// virtual node's InternalIP.
+									Name: "POD_IP",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											FieldPath: "status.podIP",
+										},
+									},
+								},
+							},
+							Ports: []corev1.ContainerPort{
+								{
+									// Kubelet shim. The virtual k3s API
+									// server dials this port (via the
+									// patched InternalIP) when handling
+									// logs/exec/portforward.
+									Name:          "kubelet",
+									ContainerPort: KubeletShimPort,
+									Protocol:      corev1.ProtocolTCP,
 								},
 							},
 							Resources: corev1.ResourceRequirements{

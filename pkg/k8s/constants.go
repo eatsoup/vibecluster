@@ -18,6 +18,11 @@ const (
 	K3sPort = 6443
 	// ServicePort is the exposed service port.
 	ServicePort = 443
+	// KubeletShimPort is the port the syncer's kubelet shim listens on.
+	// The synced virtual node's daemonEndpoints.kubeletEndpoint.port is set
+	// to this value so the virtual k3s API server forwards logs/exec/portforward
+	// requests to the shim instead of the real host kubelet.
+	KubeletShimPort = 10250
 
 	// NamespacePrefix is the prefix for vibecluster namespaces.
 	NamespacePrefix = "vc-"

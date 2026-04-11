@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -152,6 +153,48 @@ func TestCreateVirtualCluster(t *testing.T) {
 	}
 	if !foundEnv {
 		t.Errorf("syncer container missing VCLUSTER_NAME env var")
+	}
+
+	// Verify POD_IP env var is sourced from the downward API — the kubelet
+	// shim needs the pod IP both as its bind/SAN address and as the
+	// InternalIP it patches onto every synced virtual node.
+	var podIPEnv *corev1.EnvVar
+	for i := range syncerCont.Env {
+		if syncerCont.Env[i].Name == "POD_IP" {
+			podIPEnv = &syncerCont.Env[i]
+		}
+	}
+	if podIPEnv == nil {
+		t.Fatalf("syncer container missing POD_IP env var")
+	}
+	if podIPEnv.ValueFrom == nil || podIPEnv.ValueFrom.FieldRef == nil ||
+		podIPEnv.ValueFrom.FieldRef.FieldPath != "status.podIP" {
+		t.Errorf("POD_IP env should reference status.podIP via downward API, got %+v", podIPEnv.ValueFrom)
+	}
+
+	// Verify the kubelet shim port is exposed.
+	foundShimPort := false
+	for _, p := range syncerCont.Ports {
+		if p.ContainerPort == KubeletShimPort {
+			foundShimPort = true
+		}
+	}
+	if !foundShimPort {
+		t.Errorf("syncer container missing kubelet shim containerPort %d, got %+v", KubeletShimPort, syncerCont.Ports)
+	}
+
+	// Verify k3s is configured to dial kubelets by InternalIP — the syncer
+	// rewrites InternalIP to its own pod IP, so this is what routes
+	// logs/exec/portforward to the shim instead of the host kubelet.
+	k3sArgs := strings.Join(k3sCont.Args, " ")
+	if !strings.Contains(k3sArgs, "kubelet-preferred-address-types=InternalIP") {
+		t.Errorf("k3s args missing --kube-apiserver-arg=kubelet-preferred-address-types=InternalIP; got %v", k3sCont.Args)
+	}
+	// With --disable-agent there is no per-node tunnel for the apiserver to
+	// dial kubelets through, so the egress selector mode must be "disabled"
+	// for kubectl logs/exec/portforward to even reach the shim. See issue #21.
+	if !strings.Contains(k3sArgs, "--egress-selector-mode=disabled") {
+		t.Errorf("k3s args missing --egress-selector-mode=disabled; got %v", k3sCont.Args)
 	}
 
 	// Verify syncer data volume is read-only
