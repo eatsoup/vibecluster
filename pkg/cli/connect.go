@@ -42,9 +42,11 @@ func runConnect(name string, opts *connectOptions) error {
 
 	ctx := cmd_context()
 
-	// Check the cluster exists and is ready
+	// Check the cluster exists and is ready. WaitForReady fast-fails with a
+	// NotFound error if the namespace doesn't exist (issue #19), so we
+	// propagate it as-is rather than wrapping it as "not ready".
 	if err := k8s.WaitForReady(ctx, client, name, 30e9); err != nil {
-		return fmt.Errorf("virtual cluster %q is not ready: %w", name, err)
+		return err
 	}
 
 	server := opts.server

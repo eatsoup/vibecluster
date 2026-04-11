@@ -663,6 +663,81 @@ func TestReconcileVirtualPodFromHost_BindsAndCopiesStatus(t *testing.T) {
 	}
 }
 
+// Issue #18: when a Service of type LoadBalancer is created inside a virtual
+// cluster, the syncer copies the spec to the host but never reflected the
+// LB-assigned address back, so users saw EXTERNAL-IP <pending> forever.
+// reconcileVirtualServiceFromHost should mirror status.loadBalancer onto the
+// virtual service.
+func TestReconcileVirtualServiceFromHost_CopiesLBStatus(t *testing.T) {
+	vClient := fake.NewSimpleClientset(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "nginx-lb", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{{Port: 8080}},
+		},
+	})
+	s := New("test", nil, vClient)
+	ctx := context.Background()
+
+	hostSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-x-nginx-lb-x-default",
+			Namespace: "vc-test",
+			Labels: map[string]string{
+				LabelSyncedFrom:       "test",
+				LabelVirtualName:      "nginx-lb",
+				LabelVirtualNamespace: "default",
+			},
+		},
+		Status: corev1.ServiceStatus{
+			LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{
+					{IP: "10.0.0.38"},
+				},
+			},
+		},
+	}
+
+	if err := s.reconcileVirtualServiceFromHost(ctx, hostSvc); err != nil {
+		t.Fatalf("reconcileVirtualServiceFromHost failed: %v", err)
+	}
+
+	vSvc, err := vClient.CoreV1().Services("default").Get(ctx, "nginx-lb", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("virtual service gone: %v", err)
+	}
+	if len(vSvc.Status.LoadBalancer.Ingress) != 1 || vSvc.Status.LoadBalancer.Ingress[0].IP != "10.0.0.38" {
+		t.Errorf("LB ingress not reflected back: %+v", vSvc.Status.LoadBalancer)
+	}
+}
+
+func TestReconcileVirtualServiceFromHost_NoVirtualService(t *testing.T) {
+	vClient := fake.NewSimpleClientset()
+	s := New("test", nil, vClient)
+	ctx := context.Background()
+
+	hostSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-x-ghost-x-default",
+			Namespace: "vc-test",
+			Labels: map[string]string{
+				LabelVirtualName:      "ghost",
+				LabelVirtualNamespace: "default",
+			},
+		},
+		Status: corev1.ServiceStatus{
+			LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.1"}},
+			},
+		},
+	}
+
+	// No matching virtual service — should be a no-op, not an error.
+	if err := s.reconcileVirtualServiceFromHost(ctx, hostSvc); err != nil {
+		t.Fatalf("expected nil error for missing virtual service, got %v", err)
+	}
+}
+
 func TestReconcileVirtualPodFromHost_NoVirtualPod(t *testing.T) {
 	vClient := fake.NewSimpleClientset()
 	s := New("test", nil, vClient)

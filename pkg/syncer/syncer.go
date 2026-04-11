@@ -108,6 +108,20 @@ func (s *Syncer) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Watch host services so we can reflect their LoadBalancer status
+	// (status.loadBalancer.ingress) back into the virtual cluster — without
+	// this, a Service of type LoadBalancer created inside a vcluster shows
+	// EXTERNAL-IP <pending> forever even when the host LB has assigned an
+	// address. See issue #18.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fmt.Printf("  Starting host services syncer (host -> virtual status)\n")
+		if err := s.syncHostServices(ctx); err != nil && ctx.Err() == nil {
+			errCh <- fmt.Errorf("host services syncer: %w", err)
+		}
+	}()
+
 	// Start the kubelet shim if configured. This serves the kubelet API
 	// (logs/exec/attach/portforward) on ShimPort and proxies each request
 	// to the matching pod subresource on the host kube-apiserver, after
@@ -410,6 +424,77 @@ func (s *Syncer) reconcileVirtualPodFromHost(ctx context.Context, hostPod *corev
 			return nil
 		}
 		return fmt.Errorf("updating virtual pod status: %w", err)
+	}
+	return nil
+}
+
+// syncHostServices watches synced services on the host cluster and reflects
+// their status (specifically status.loadBalancer.ingress for LoadBalancer
+// services) back onto the matching virtual service. Without this, a Service
+// of type LoadBalancer created inside a virtual cluster appears stuck on
+// EXTERNAL-IP <pending> even when the host's LB controller has long since
+// assigned an address. See issue #18.
+func (s *Syncer) syncHostServices(ctx context.Context) error {
+	selector := fmt.Sprintf("%s=%s", LabelSyncedFrom, s.name)
+	return watchWithRetry(ctx, "host-services", func(ctx context.Context) error {
+		watcher, err := s.hostClient.CoreV1().Services(s.hostNS).Watch(ctx, metav1.ListOptions{
+			LabelSelector: selector,
+		})
+		if err != nil {
+			return fmt.Errorf("watching host services: %w", err)
+		}
+		defer watcher.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case event, ok := <-watcher.ResultChan():
+				if !ok {
+					return fmt.Errorf("watch channel closed")
+				}
+				hostSvc, ok := event.Object.(*corev1.Service)
+				if !ok {
+					continue
+				}
+				switch event.Type {
+				case watch.Added, watch.Modified:
+					if err := s.reconcileVirtualServiceFromHost(ctx, hostSvc); err != nil {
+						fmt.Printf("  [host-services] reconcile error for %s: %v\n", hostSvc.Name, err)
+					}
+				}
+			}
+		}
+	})
+}
+
+// reconcileVirtualServiceFromHost copies the host service's LoadBalancer
+// status onto the matching virtual service.
+func (s *Syncer) reconcileVirtualServiceFromHost(ctx context.Context, hostSvc *corev1.Service) error {
+	vName := hostSvc.Labels[LabelVirtualName]
+	vNamespace := hostSvc.Labels[LabelVirtualNamespace]
+	if vName == "" || vNamespace == "" {
+		return nil
+	}
+
+	vSvc, err := s.vClient.CoreV1().Services(vNamespace).Get(ctx, vName, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("getting virtual service: %w", err)
+	}
+
+	if reflect.DeepEqual(vSvc.Status.LoadBalancer, hostSvc.Status.LoadBalancer) {
+		return nil
+	}
+	vSvc.Status.LoadBalancer = *hostSvc.Status.LoadBalancer.DeepCopy()
+	if _, err := s.vClient.CoreV1().Services(vSvc.Namespace).UpdateStatus(ctx, vSvc, metav1.UpdateOptions{}); err != nil {
+		if errors.IsConflict(err) {
+			// Will be retried on the next watch event.
+			return nil
+		}
+		return fmt.Errorf("updating virtual service status: %w", err)
 	}
 	return nil
 }

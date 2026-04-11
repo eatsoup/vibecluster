@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -215,6 +216,33 @@ func runExposePersistent(name string, opts *exposeOptions) error {
 	}
 	fmt.Printf("External address: %s\n", addr.URL())
 
+	// LoadBalancer controllers (notably klipper-lb / k3s ServiceLB) write
+	// status.loadBalancer.ingress as soon as an address is *allocated*, not
+	// when it is actually serving. We've been burned by this — see issue
+	// #17 — so before declaring success, TCP-probe the address. We don't
+	// fail the command on a probe failure (the address may become reachable
+	// shortly, or the user may be on a network that just can't reach it),
+	// but we surface a loud warning so the user isn't told "success" while
+	// every kubectl call fails.
+	if addr.Source == "LoadBalancer" {
+		probeHost := addr.Host
+		probePort := addr.Port
+		if probePort == 0 {
+			probePort = 443
+		}
+		if err := tcpProbe(probeHost, int(probePort), 8*time.Second); err != nil {
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintf(os.Stderr, "WARNING: LoadBalancer address %s:%d is not accepting connections (%v).\n", probeHost, probePort, err)
+			fmt.Fprintln(os.Stderr, "  The LB controller has assigned an address but no backend is serving on it yet.")
+			fmt.Fprintln(os.Stderr, "  Common causes:")
+			fmt.Fprintln(os.Stderr, "    - klipper-lb svclb pod is unschedulable because another Service holds the host port")
+			fmt.Fprintln(os.Stderr, "    - your LB controller hasn't finished provisioning")
+			fmt.Fprintln(os.Stderr, "    - a firewall blocks the port")
+			fmt.Fprintln(os.Stderr, "  The kubeconfig below points at this address — kubectl calls will fail until it becomes reachable.")
+			fmt.Fprintln(os.Stderr)
+		}
+	}
+
 	fmt.Println("Retrieving kubeconfig...")
 	cfg, err := kubeconfig.RetrieveWithOptions(ctx, client, restConfig, name, kubeconfig.RetrieveOptions{
 		Server:                addr.URL(),
@@ -235,5 +263,20 @@ func runExposePersistent(name string, opts *exposeOptions) error {
 	if !addr.CertVerifies {
 		fmt.Println("Note: kubeconfig uses insecure-skip-tls-verify because the LoadBalancer address is not in the k3s server certificate SANs.")
 	}
+	return nil
+}
+
+// tcpProbe attempts a single TCP connection to host:port within budget.
+// Returns nil on success or the dial error on failure (including timeout).
+// We deliberately don't retry — the caller's intent is "is this reachable
+// right now", and the caller already waited for the LB controller to
+// publish an address before calling us.
+func tcpProbe(host string, port int, budget time.Duration) error {
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	conn, err := net.DialTimeout("tcp", addr, budget)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
 	return nil
 }
