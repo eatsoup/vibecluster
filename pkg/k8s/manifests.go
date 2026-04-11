@@ -24,6 +24,11 @@ type CreateOptions struct {
 	ExposeType         string
 	ExposeIngressClass string
 	ExposeHost         string
+	// Resources caps the host resources the virtual cluster can consume.
+	// When set, a ResourceQuota and a LimitRange are installed on the
+	// vc-<name> namespace. The k3s control plane's own usage counts against
+	// the budget; size accordingly. nil means no quota.
+	Resources *ResourceLimits
 }
 
 // CreateVirtualCluster deploys all resources for a virtual cluster.
@@ -71,12 +76,46 @@ func CreateVirtualCluster(ctx context.Context, client kubernetes.Interface, name
 		return fmt.Errorf("creating services: %w", err)
 	}
 
-	// 6. Create statefulset
+	// 6. Create ResourceQuota + LimitRange (if resources specified). This
+	//    must happen *before* the StatefulSet so the LimitRange's defaults
+	//    apply to the k3s/syncer pods at admission time — without that, the
+	//    quota would reject them for having no requests/limits set.
+	if !opts.Resources.IsEmpty() {
+		fmt.Printf("  Creating ResourceQuota and LimitRange...\n")
+		if err := createResourceLimits(ctx, client, name, ns, labels, opts.Resources); err != nil {
+			return fmt.Errorf("creating resource limits: %w", err)
+		}
+	}
+
+	// 7. Create statefulset
 	fmt.Printf("  Creating StatefulSet...\n")
 	if err := createStatefulSet(ctx, client, name, ns, labels, syncerImage, opts.ImagePullSecret, opts.ExposeHost); err != nil {
 		return fmt.Errorf("creating statefulset: %w", err)
 	}
 
+	return nil
+}
+
+// createResourceLimits installs the per-vcluster ResourceQuota and the
+// matching LimitRange that supplies default container requests/limits so
+// workloads without explicit resources are still admissible under the quota.
+func createResourceLimits(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, limits *ResourceLimits) error {
+	opts := BuilderOptions{
+		Name:      name,
+		Namespace: ns,
+		Labels:    labels,
+		Resources: limits,
+	}
+	if rq := BuildResourceQuota(opts); rq != nil {
+		if _, err := client.CoreV1().ResourceQuotas(ns).Create(ctx, rq, metav1.CreateOptions{}); err != nil {
+			return fmt.Errorf("creating ResourceQuota: %w", err)
+		}
+	}
+	if lr := BuildLimitRange(opts); lr != nil {
+		if _, err := client.CoreV1().LimitRanges(ns).Create(ctx, lr, metav1.CreateOptions{}); err != nil {
+			return fmt.Errorf("creating LimitRange: %w", err)
+		}
+	}
 	return nil
 }
 

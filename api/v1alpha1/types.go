@@ -27,6 +27,38 @@ type VirtualClusterSpec struct {
 	// its in-cluster ClusterIP service.
 	// +optional
 	Expose *VirtualClusterExpose `json:"expose,omitempty"`
+
+	// Resources caps the total resources the virtual cluster can consume on
+	// the host. When set, vibecluster installs a ResourceQuota (and a
+	// LimitRange providing default container requests/limits) on the
+	// vc-<name> namespace. The k3s control plane's own usage counts against
+	// these caps; size accordingly.
+	// +optional
+	Resources *VirtualClusterResources `json:"resources,omitempty"`
+}
+
+// VirtualClusterResources caps how much of the host's CPU, memory, storage,
+// and pod count a single virtual cluster can use. Any field left empty is not
+// enforced.
+type VirtualClusterResources struct {
+	// CPU is the total CPU budget for the virtual cluster (e.g. "4", "500m").
+	// Enforced as both requests.cpu and limits.cpu in a namespace ResourceQuota.
+	// +optional
+	CPU string `json:"cpu,omitempty"`
+
+	// Memory is the total memory budget (e.g. "8Gi"). Enforced as both
+	// requests.memory and limits.memory in a namespace ResourceQuota.
+	// +optional
+	Memory string `json:"memory,omitempty"`
+
+	// Storage is the total persistent storage budget across all PVCs
+	// (e.g. "50Gi"). Enforced as requests.storage in a namespace ResourceQuota.
+	// +optional
+	Storage string `json:"storage,omitempty"`
+
+	// Pods caps the maximum number of pods that can run in the namespace.
+	// +optional
+	Pods int32 `json:"pods,omitempty"`
 }
 
 // VirtualClusterExposeType is the strategy used to expose the virtual cluster API.

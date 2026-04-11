@@ -177,6 +177,12 @@ Synced resources on the host are labeled with:
 | `--print` | `false` | Print kubeconfig to stdout |
 | `--mode` | `auto` | Creation mode: `auto` (use the operator if installed, otherwise raw manifests), `legacy` (always raw manifests), or `operator` (require the CRD) |
 | `--cr-namespace` | `default` | Namespace to create the `VirtualCluster` CR in (operator mode only) |
+| `--cpu` | _(unset)_ | Total CPU budget for the virtual cluster (e.g. `4`, `500m`). Enforced via a namespace `ResourceQuota`. The k3s control plane counts against this. |
+| `--memory` | _(unset)_ | Total memory budget for the virtual cluster (e.g. `8Gi`). Enforced via a namespace `ResourceQuota`. The k3s control plane counts against this. |
+| `--storage` | _(unset)_ | Total persistent storage budget across all PVCs (e.g. `50Gi`). Enforced via a namespace `ResourceQuota`. |
+| `--pods` | `0` | Maximum pod count in the virtual cluster (`0` = unlimited). |
+
+When any of `--cpu`, `--memory`, `--storage`, or `--pods` is set, vibecluster also installs a `LimitRange` in the `vc-<name>` namespace that supplies default container CPU/memory requests and limits — without it, workloads created without explicit resource requests would be rejected by the matching ResourceQuota at admission time.
 
 When `vibecluster create` runs in operator mode, the CLI submits a `VirtualCluster` CR for the operator to reconcile rather than creating manifests directly. The `--expose`, `--expose-host`, and `--expose-ingress-class` flags are translated into the CR's `spec.expose` field, so the operator stands up the LoadBalancer or Ingress as part of reconciliation. `--image-pull-secret` is the only legacy-only flag — the CRD does not yet model it, so it's ignored in operator mode (a notice is printed).
 
@@ -260,6 +266,10 @@ dev-cluster   Running   true    vc-dev-cluster    5m
 | `expose.type` | _(unset)_ | `LoadBalancer` or `Ingress`. When unset the cluster is only reachable via its in-cluster ClusterIP service. |
 | `expose.host` | _(unset)_ | External hostname. Required for `Ingress`; also added to the k3s server certificate's TLS-SAN list so kubeconfigs validate. |
 | `expose.ingressClass` | _(unset)_ | `IngressClassName` to use when `expose.type` is `Ingress`. |
+| `resources.cpu` | _(unset)_ | Total CPU budget (e.g. `4`, `500m`). Enforced via a namespace `ResourceQuota`. Includes the k3s control plane. |
+| `resources.memory` | _(unset)_ | Total memory budget (e.g. `8Gi`). Enforced via a namespace `ResourceQuota`. Includes the k3s control plane. |
+| `resources.storage` | _(unset)_ | Total persistent storage budget across all PVCs (e.g. `50Gi`). Enforced via a namespace `ResourceQuota`. |
+| `resources.pods` | _(unset)_ | Maximum pod count. |
 
 Example with persistent Ingress exposure:
 
@@ -275,6 +285,24 @@ spec:
     host: dev.vc.example.com
     ingressClass: nginx
 ```
+
+Example with per-tenant resource limits:
+
+```yaml
+apiVersion: vibecluster.dev/v1alpha1
+kind: VirtualCluster
+metadata:
+  name: tenant-a
+  namespace: default
+spec:
+  resources:
+    cpu: "4"
+    memory: "8Gi"
+    storage: "50Gi"
+    pods: 50
+```
+
+When `spec.resources` is set, the operator installs a `ResourceQuota` and a `LimitRange` in the `vc-<name>` namespace. The `LimitRange` provides default container CPU/memory requests and limits so that workloads created inside the virtual cluster without explicit resource requests are still admissible under the quota.
 
 ### VirtualCluster status fields
 

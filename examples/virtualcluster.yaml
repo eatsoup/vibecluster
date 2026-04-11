@@ -12,3 +12,12 @@ spec:
   # k3sImage: "rancher/k3s:v1.28.5-k3s1"
   # syncerImage: "ghcr.io/eatsoup/vibecluster/syncer:latest"
   # storage: "5Gi"
+
+  # Per-tenant resource budget. When set, vibecluster installs a ResourceQuota
+  # and a LimitRange in the vc-<name> namespace. The k3s control plane counts
+  # against this budget.
+  # resources:
+  #   cpu: "4"
+  #   memory: "8Gi"
+  #   storage: "50Gi"
+  #   pods: 50

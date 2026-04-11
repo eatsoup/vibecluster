@@ -36,6 +36,34 @@ type BuilderOptions struct {
 	ExposeHost string
 	// ExposeIngressClass is the IngressClassName to use when ExposeType is "Ingress".
 	ExposeIngressClass string
+	// Resources caps the total CPU/memory/storage/pods the virtual cluster
+	// is allowed to consume on the host. When nil (or all fields empty), no
+	// quota is installed and the cluster can use whatever the host scheduler
+	// gives it. The k3s control plane's own usage counts against the budget.
+	Resources *ResourceLimits
+}
+
+// ResourceLimits is the per-vcluster resource budget enforced via a
+// namespace-scoped ResourceQuota.
+type ResourceLimits struct {
+	// CPU is the total CPU budget (e.g. "4", "500m"). Empty means unlimited.
+	CPU string
+	// Memory is the total memory budget (e.g. "8Gi"). Empty means unlimited.
+	Memory string
+	// Storage is the total persistent storage budget across all PVCs
+	// (e.g. "50Gi"). Empty means unlimited.
+	Storage string
+	// Pods is the maximum pod count. Zero means unlimited.
+	Pods int32
+}
+
+// IsEmpty reports whether the resource budget has no fields set, in which
+// case no ResourceQuota should be installed.
+func (r *ResourceLimits) IsEmpty() bool {
+	if r == nil {
+		return true
+	}
+	return r.CPU == "" && r.Memory == "" && r.Storage == "" && r.Pods == 0
 }
 
 // DefaultBuilderOptions returns BuilderOptions with sensible defaults for the given name.
@@ -231,6 +259,103 @@ func BuildService(opts BuilderOptions) *corev1.Service {
 					Port:       ServicePort,
 					TargetPort: intstr.FromInt32(K3sPort),
 					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+}
+
+// ResourceQuotaName returns the name of the ResourceQuota installed on a
+// virtual cluster's host namespace.
+func ResourceQuotaName(name string) string {
+	return "vc-" + name + "-quota"
+}
+
+// BuildResourceQuota returns a ResourceQuota for the vcluster's host namespace
+// based on opts.Resources. Returns nil when no limits are specified — callers
+// should skip creating the object in that case.
+//
+// The mapping is:
+//   - CPU     → requests.cpu and limits.cpu
+//   - Memory  → requests.memory and limits.memory
+//   - Storage → requests.storage
+//   - Pods    → pods
+//
+// CPU/memory are pinned identically as request and limit so a workload's
+// usable share is unambiguous (and so the LimitRange-supplied defaults — which
+// set request==limit — round-trip cleanly through admission). The k3s control
+// plane and syncer pods count against the budget; size accordingly.
+func BuildResourceQuota(opts BuilderOptions) *corev1.ResourceQuota {
+	if opts.Resources.IsEmpty() {
+		return nil
+	}
+	hard := corev1.ResourceList{}
+	if opts.Resources.CPU != "" {
+		q := resource.MustParse(opts.Resources.CPU)
+		hard[corev1.ResourceRequestsCPU] = q
+		hard[corev1.ResourceLimitsCPU] = q
+	}
+	if opts.Resources.Memory != "" {
+		q := resource.MustParse(opts.Resources.Memory)
+		hard[corev1.ResourceRequestsMemory] = q
+		hard[corev1.ResourceLimitsMemory] = q
+	}
+	if opts.Resources.Storage != "" {
+		hard[corev1.ResourceRequestsStorage] = resource.MustParse(opts.Resources.Storage)
+	}
+	if opts.Resources.Pods > 0 {
+		hard[corev1.ResourcePods] = *resource.NewQuantity(int64(opts.Resources.Pods), resource.DecimalSI)
+	}
+	return &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ResourceQuotaName(opts.Name),
+			Namespace: opts.Namespace,
+			Labels:    opts.Labels,
+		},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: hard,
+		},
+	}
+}
+
+// LimitRangeName returns the name of the LimitRange installed alongside the
+// ResourceQuota for a virtual cluster's host namespace.
+func LimitRangeName(name string) string {
+	return "vc-" + name + "-limits"
+}
+
+// BuildLimitRange returns a LimitRange that supplies default container
+// requests and limits in the vcluster's host namespace, so workloads created
+// inside the vcluster without explicit resources don't get rejected by the
+// ResourceQuota. Returns nil when no quota is installed.
+func BuildLimitRange(opts BuilderOptions) *corev1.LimitRange {
+	if opts.Resources.IsEmpty() {
+		return nil
+	}
+	// A ResourceQuota that constrains requests.cpu/limits.cpu (or the memory
+	// equivalents) requires every pod admitted to the namespace to declare
+	// the corresponding request and limit. The LimitRange backstops that by
+	// supplying defaults for any container that omits them.
+	def := corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("100m"),
+		corev1.ResourceMemory: resource.MustParse("128Mi"),
+	}
+	defReq := corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("100m"),
+		corev1.ResourceMemory: resource.MustParse("128Mi"),
+	}
+	return &corev1.LimitRange{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      LimitRangeName(opts.Name),
+			Namespace: opts.Namespace,
+			Labels:    opts.Labels,
+		},
+		Spec: corev1.LimitRangeSpec{
+			Limits: []corev1.LimitRangeItem{
+				{
+					Type:           corev1.LimitTypeContainer,
+					Default:        def,
+					DefaultRequest: defReq,
 				},
 			},
 		},

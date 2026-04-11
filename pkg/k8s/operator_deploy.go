@@ -157,6 +157,10 @@ func ensureOperatorRBAC(ctx context.Context, client kubernetes.Interface, labels
 		{APIGroups: []string{""}, Resources: []string{"serviceaccounts"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
 		{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
 		{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
+		// resourcequotas and limitranges are how spec.resources is enforced
+		// on the per-vcluster namespace.
+		{APIGroups: []string{""}, Resources: []string{"resourcequotas"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"}},
+		{APIGroups: []string{""}, Resources: []string{"limitranges"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"}},
 		{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
 		{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"ingresses"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"}},
 		// RBAC management: the operator creates per-vcluster (Cluster)Roles and
@@ -406,6 +410,16 @@ func buildVirtualClusterCRD() *apiextensionsv1.CustomResourceDefinition {
 												},
 												"host":         {Type: "string"},
 												"ingressClass": {Type: "string"},
+											},
+										},
+										"resources": {
+											Type:        "object",
+											Description: "Resources caps the total resources the virtual cluster can consume on the host. The k3s control plane's own usage counts against these caps.",
+											Properties: map[string]apiextensionsv1.JSONSchemaProps{
+												"cpu":     {Type: "string"},
+												"memory":  {Type: "string"},
+												"storage": {Type: "string"},
+												"pods":    {Type: "integer", Format: "int32", Minimum: ptr.To(float64(0))},
 											},
 										},
 									},

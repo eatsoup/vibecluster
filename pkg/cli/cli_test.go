@@ -51,6 +51,10 @@ func TestCreateCommand_Flags(t *testing.T) {
 		{"print", "false"},
 		{"syncer-image", ""},
 		{"image-pull-secret", ""},
+		{"cpu", ""},
+		{"memory", ""},
+		{"storage", ""},
+		{"pods", "0"},
 	}
 
 	for _, f := range flags {
@@ -263,6 +267,34 @@ func TestCreateCommand_ModeFlags(t *testing.T) {
 	}
 	if create.Flags().Lookup("cr-namespace") == nil {
 		t.Error("--cr-namespace flag not found")
+	}
+}
+
+func TestResourceLimitsFromOpts(t *testing.T) {
+	cases := []struct {
+		name string
+		opts createOptions
+		want bool // want non-nil
+	}{
+		{"none", createOptions{}, false},
+		{"cpu", createOptions{cpu: "2"}, true},
+		{"memory", createOptions{memory: "4Gi"}, true},
+		{"storage", createOptions{storage: "10Gi"}, true},
+		{"pods", createOptions{pods: 5}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resourceLimitsFromOpts(&tc.opts)
+			if (got != nil) != tc.want {
+				t.Errorf("resourceLimitsFromOpts: got non-nil=%v, want non-nil=%v", got != nil, tc.want)
+			}
+			if got != nil {
+				if got.CPU != tc.opts.cpu || got.Memory != tc.opts.memory ||
+					got.Storage != tc.opts.storage || got.Pods != tc.opts.pods {
+					t.Errorf("resourceLimitsFromOpts result mismatch: got %+v from %+v", got, tc.opts)
+				}
+			}
+		})
 	}
 }
 

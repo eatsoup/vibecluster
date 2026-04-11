@@ -162,6 +162,65 @@ func TestCreateVirtualClusterCR_PopulatesExpose(t *testing.T) {
 	}
 }
 
+func TestCreateVirtualClusterCR_PopulatesResources(t *testing.T) {
+	scheme := runtime.NewScheme()
+	gvrToListKind := map[schema.GroupVersionResource]string{
+		VirtualClusterGVR: "VirtualClusterList",
+	}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind)
+
+	spec := VirtualClusterCRSpec{
+		Resources: &ResourceLimits{
+			CPU:    "4",
+			Memory: "8Gi",
+			Pods:   30,
+		},
+	}
+	if err := createVirtualClusterCRWith(context.Background(), dyn, "rqvc", "default", spec); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+	got, err := dyn.Resource(VirtualClusterGVR).Namespace("default").Get(context.Background(), "rqvc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	cpu, _, _ := unstructured.NestedString(got.Object, "spec", "resources", "cpu")
+	if cpu != "4" {
+		t.Errorf("spec.resources.cpu = %q, want 4", cpu)
+	}
+	mem, _, _ := unstructured.NestedString(got.Object, "spec", "resources", "memory")
+	if mem != "8Gi" {
+		t.Errorf("spec.resources.memory = %q, want 8Gi", mem)
+	}
+	// Storage was not set; the field should be absent so the CRD-side
+	// default (or "no quota for storage") applies.
+	if _, found, _ := unstructured.NestedString(got.Object, "spec", "resources", "storage"); found {
+		t.Error("spec.resources.storage should be omitted when not set")
+	}
+	pods, _, _ := unstructured.NestedInt64(got.Object, "spec", "resources", "pods")
+	if pods != 30 {
+		t.Errorf("spec.resources.pods = %d, want 30", pods)
+	}
+}
+
+func TestCreateVirtualClusterCR_NoResourcesOmitsField(t *testing.T) {
+	scheme := runtime.NewScheme()
+	gvrToListKind := map[schema.GroupVersionResource]string{
+		VirtualClusterGVR: "VirtualClusterList",
+	}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind)
+
+	if err := createVirtualClusterCRWith(context.Background(), dyn, "norq", "default", VirtualClusterCRSpec{}); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+	got, err := dyn.Resource(VirtualClusterGVR).Namespace("default").Get(context.Background(), "norq", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	if _, found, _ := unstructured.NestedMap(got.Object, "spec", "resources"); found {
+		t.Error("spec.resources should be omitted when no resources configured")
+	}
+}
+
 func TestCreateVirtualClusterCR_NoExposeOmitsField(t *testing.T) {
 	scheme := runtime.NewScheme()
 	gvrToListKind := map[schema.GroupVersionResource]string{

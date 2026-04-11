@@ -293,6 +293,58 @@ func TestCreateVirtualCluster_ImagePullSecret(t *testing.T) {
 	}
 }
 
+func TestCreateVirtualCluster_WithResourceLimits(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ctx := context.Background()
+
+	err := CreateVirtualCluster(ctx, client, "rqtest", CreateOptions{
+		Resources: &ResourceLimits{
+			CPU:     "2",
+			Memory:  "4Gi",
+			Storage: "20Gi",
+			Pods:    15,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVirtualCluster failed: %v", err)
+	}
+
+	rq, err := client.CoreV1().ResourceQuotas("vc-rqtest").Get(ctx, ResourceQuotaName("rqtest"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("ResourceQuota not created: %v", err)
+	}
+	cpuQ := rq.Spec.Hard[corev1.ResourceRequestsCPU]
+	if cpuQ.String() != "2" {
+		t.Errorf("requests.cpu = %s, want 2", cpuQ.String())
+	}
+	podsQ := rq.Spec.Hard[corev1.ResourcePods]
+	if podsQ.Value() != 15 {
+		t.Errorf("pods = %d, want 15", podsQ.Value())
+	}
+
+	if _, err := client.CoreV1().LimitRanges("vc-rqtest").Get(ctx, LimitRangeName("rqtest"), metav1.GetOptions{}); err != nil {
+		t.Fatalf("LimitRange not created: %v", err)
+	}
+}
+
+func TestCreateVirtualCluster_NoResourceQuotaByDefault(t *testing.T) {
+	// Without a Resources block, neither a ResourceQuota nor a LimitRange
+	// should be installed — vcluster's existing semantics are unbounded.
+	client := fake.NewSimpleClientset()
+	ctx := context.Background()
+
+	if err := CreateVirtualCluster(ctx, client, "noquota", CreateOptions{}); err != nil {
+		t.Fatalf("CreateVirtualCluster failed: %v", err)
+	}
+
+	if _, err := client.CoreV1().ResourceQuotas("vc-noquota").Get(ctx, ResourceQuotaName("noquota"), metav1.GetOptions{}); err == nil {
+		t.Error("ResourceQuota should not exist when no Resources are specified")
+	}
+	if _, err := client.CoreV1().LimitRanges("vc-noquota").Get(ctx, LimitRangeName("noquota"), metav1.GetOptions{}); err == nil {
+		t.Error("LimitRange should not exist when no Resources are specified")
+	}
+}
+
 func TestCreateVirtualCluster_DuplicateNamespace(t *testing.T) {
 	client := fake.NewSimpleClientset(&corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: "vc-existing"},
