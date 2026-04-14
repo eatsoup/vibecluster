@@ -29,6 +29,12 @@ type CreateOptions struct {
 	// vc-<name> namespace. The k3s control plane's own usage counts against
 	// the budget; size accordingly. nil means no quota.
 	Resources *ResourceLimits
+	// VNode switches the cluster to the nested data-plane prototype: the
+	// k3s server is configured with flannel + network-policy + servicelb,
+	// the flat workload syncer is disabled, and a privileged Deployment
+	// runs k3s agent joined to the virtual server so real workloads run
+	// inside an in-vcluster kubelet. See issue #27.
+	VNode bool
 }
 
 // CreateVirtualCluster deploys all resources for a virtual cluster.
@@ -89,8 +95,17 @@ func CreateVirtualCluster(ctx context.Context, client kubernetes.Interface, name
 
 	// 7. Create statefulset
 	fmt.Printf("  Creating StatefulSet...\n")
-	if err := createStatefulSet(ctx, client, name, ns, labels, syncerImage, opts.ImagePullSecret, opts.ExposeHost); err != nil {
+	if err := createStatefulSet(ctx, client, name, ns, labels, syncerImage, opts.ImagePullSecret, opts.ExposeHost, opts.VNode); err != nil {
 		return fmt.Errorf("creating statefulset: %w", err)
+	}
+
+	// 8. In vnode mode, create the privileged k3s-agent Deployment that
+	//    acts as the single virtual node for this prototype (issue #27).
+	if opts.VNode {
+		fmt.Printf("  Creating vnode agent Deployment...\n")
+		if err := createVNodeDeployment(ctx, client, name, ns, labels, opts.ImagePullSecret); err != nil {
+			return fmt.Errorf("creating vnode deployment: %w", err)
+		}
 	}
 
 	return nil
@@ -373,41 +388,8 @@ func createServices(ctx context.Context, client kubernetes.Interface, name, ns s
 	return nil
 }
 
-func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, syncerImage, imagePullSecret string, exposeHost string) error {
-	k3sArgs := []string{
-		"server",
-		// coredns is disabled because the virtual cluster has no kubelet (--disable-agent)
-		// and no CNI (--flannel-backend=none), so the coredns Deployment that k3s ships
-		// would never schedule and stays Pending forever. The syncer also skips kube-system,
-		// so it cannot translate the pod to the host. See issue #5.
-		"--disable=traefik,servicelb,metrics-server,local-storage,coredns",
-		"--disable-agent",
-		"--disable-cloud-controller",
-		"--disable-network-policy",
-		"--disable-helm-controller",
-		"--flannel-backend=none",
-		// With --disable-agent there is no per-node tunnel for the apiserver
-		// to dial kubelets through, so the default egress-selector mode
-		// ("agent") makes kubectl logs/exec/portforward fail with a 502 the
-		// instant kube-apiserver tries to reach a kubelet. Setting this to
-		// "disabled" makes kube-apiserver dial kubelet addresses (i.e. our
-		// shim) directly via TCP. See issue #21.
-		"--egress-selector-mode=disabled",
-		"--kube-controller-manager-arg=controllers=*,-nodeipam,-nodelifecycle,-persistentvolume-binder,-attachdetach,-persistentvolume-expander,-cloud-node-lifecycle,-ttl",
-		// Force kube-apiserver to dial the kubelet by InternalIP. The
-		// syncer rewrites every synced node's InternalIP to its own pod IP
-		// (where the kubelet shim listens), so this is what makes
-		// logs/exec/portforward route through the shim instead of the real
-		// host kubelet — which doesn't know virtual pod names. See issue #21.
-		"--kube-apiserver-arg=kubelet-preferred-address-types=InternalIP",
-		"--data-dir=/data/k3s",
-		"--tls-san=" + name + "." + ns + ".svc.cluster.local",
-		"--tls-san=" + name + "." + ns + ".svc",
-		"--tls-san=" + name,
-	}
-	if exposeHost != "" {
-		k3sArgs = append(k3sArgs, "--tls-san="+exposeHost)
-	}
+func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, syncerImage, imagePullSecret string, exposeHost string, vnode bool) error {
+	k3sArgs := buildK3sServerArgs(name, ns, exposeHost, vnode)
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -425,7 +407,7 @@ func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, n
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName:           "vc-" + name,
+					ServiceAccountName:            "vc-" + name,
 					TerminationGracePeriodSeconds: ptr.To[int64](10),
 					Containers: []corev1.Container{
 						{
@@ -485,25 +467,7 @@ func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, n
 						{
 							Name:  "syncer",
 							Image: syncerImage,
-							Env: []corev1.EnvVar{
-								{
-									Name:  "VCLUSTER_NAME",
-									Value: name,
-								},
-								{
-									// POD_IP is needed by the kubelet shim:
-									// it's the bind address, the SAN baked
-									// into its TLS cert, and the value the
-									// syncer patches into every synced
-									// virtual node's InternalIP.
-									Name: "POD_IP",
-									ValueFrom: &corev1.EnvVarSource{
-										FieldRef: &corev1.ObjectFieldSelector{
-											FieldPath: "status.podIP",
-										},
-									},
-								},
-							},
+							Env:   buildSyncerEnv(name, vnode),
 							Ports: []corev1.ContainerPort{
 								{
 									// Kubelet shim. The virtual k3s API
@@ -569,6 +533,205 @@ func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, n
 	return err
 }
 
+// buildK3sServerArgs returns the arg list for the k3s server container. The
+// vnode variant flips the networking defaults back on (flannel, network
+// policy, servicelb, coredns) because a real agent Deployment is joining the
+// cluster and will run those components — see createVNodeDeployment and
+// issue #27.
+func buildK3sServerArgs(name, ns, exposeHost string, vnode bool) []string {
+	tlsSAN := []string{
+		"--tls-san=" + name + "." + ns + ".svc.cluster.local",
+		"--tls-san=" + name + "." + ns + ".svc",
+		"--tls-san=" + name,
+	}
+	if exposeHost != "" {
+		tlsSAN = append(tlsSAN, "--tls-san="+exposeHost)
+	}
+
+	if vnode {
+		// Keep --disable-agent: the server pod itself is not a node. The
+		// vnode Deployment is. Leave flannel + network-policy + servicelb
+		// + coredns ON so NetworkPolicy and LoadBalancer Services work
+		// inside the virtual cluster without any syncer translation.
+		args := []string{
+			"server",
+			"--disable=traefik,metrics-server,local-storage",
+			"--disable-agent",
+			"--disable-cloud-controller",
+			"--disable-helm-controller",
+			"--token=" + VNodeAgentToken(name),
+			"--data-dir=/data/k3s",
+		}
+		return append(args, tlsSAN...)
+	}
+
+	args := []string{
+		"server",
+		// coredns is disabled because the virtual cluster has no kubelet (--disable-agent)
+		// and no CNI (--flannel-backend=none), so the coredns Deployment that k3s ships
+		// would never schedule and stays Pending forever. The syncer also skips kube-system,
+		// so it cannot translate the pod to the host. See issue #5.
+		"--disable=traefik,servicelb,metrics-server,local-storage,coredns",
+		"--disable-agent",
+		"--disable-cloud-controller",
+		"--disable-network-policy",
+		"--disable-helm-controller",
+		"--flannel-backend=none",
+		// With --disable-agent there is no per-node tunnel for the apiserver
+		// to dial kubelets through, so the default egress-selector mode
+		// ("agent") makes kubectl logs/exec/portforward fail with a 502 the
+		// instant kube-apiserver tries to reach a kubelet. Setting this to
+		// "disabled" makes kube-apiserver dial kubelet addresses (i.e. our
+		// shim) directly via TCP. See issue #21.
+		"--egress-selector-mode=disabled",
+		"--kube-controller-manager-arg=controllers=*,-nodeipam,-nodelifecycle,-persistentvolume-binder,-attachdetach,-persistentvolume-expander,-cloud-node-lifecycle,-ttl",
+		// Force kube-apiserver to dial the kubelet by InternalIP. The
+		// syncer rewrites every synced node's InternalIP to its own pod IP
+		// (where the kubelet shim listens), so this is what makes
+		// logs/exec/portforward route through the shim instead of the real
+		// host kubelet — which doesn't know virtual pod names. See issue #21.
+		"--kube-apiserver-arg=kubelet-preferred-address-types=InternalIP",
+		"--data-dir=/data/k3s",
+	}
+	return append(args, tlsSAN...)
+}
+
+// buildSyncerEnv returns the env block for the syncer sidecar. The POD_IP
+// entry is what the kubelet shim uses as its bind address / TLS SAN / the
+// InternalIP it patches onto synced nodes; in vnode mode we also set
+// EnvVNodeMode so the syncer skips every workload sync loop.
+func buildSyncerEnv(name string, vnode bool) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{Name: "VCLUSTER_NAME", Value: name},
+		{
+			Name: "POD_IP",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "status.podIP",
+				},
+			},
+		},
+	}
+	if vnode {
+		env = append(env, corev1.EnvVar{Name: EnvVNodeMode, Value: "true"})
+	}
+	return env
+}
+
+// VNodeAgentToken returns the deterministic k3s join token used for the
+// prototype. One per-vcluster value, derived from the name, so the agent
+// pod and server pod agree without any shared-secret bootstrap dance.
+// Productization should replace this with a generated secret.
+func VNodeAgentToken(name string) string {
+	return "vibecluster-vnode-" + name
+}
+
+// createVNodeDeployment stands up the privileged k3s-agent Deployment that
+// forms the single virtual node for a vnode-mode cluster (issue #27).
+//
+// The agent joins the virtual k3s server via the in-cluster Service DNS
+// name (which is in the server cert's SAN list), using the deterministic
+// per-vcluster token. One replica for the prototype; multi-node is
+// productization scope.
+//
+// This pod needs privileged: true on a stock host cluster: the embedded
+// kubelet mounts cgroups, the CNI (flannel) manipulates iptables/netlink,
+// and containerd-in-containerd needs /dev access. Running non-privileged
+// is feasible with Sysbox on the host — see the rootless investigation
+// on issue #27 for why we are explicitly not doing that here.
+func createVNodeDeployment(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, imagePullSecret string) error {
+	depName := name + "-vnode"
+	depLabels := map[string]string{}
+	for k, v := range labels {
+		depLabels[k] = v
+	}
+	depLabels["vibecluster.dev/component"] = "vnode"
+
+	serverURL := "https://" + name + "." + ns + ".svc.cluster.local:" + fmt.Sprintf("%d", ServicePort)
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   depName,
+			Labels: depLabels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](1),
+			Selector: &metav1.LabelSelector{MatchLabels: depLabels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: depLabels},
+				Spec: corev1.PodSpec{
+					ServiceAccountName:            "vc-" + name,
+					TerminationGracePeriodSeconds: ptr.To[int64](10),
+					Containers: []corev1.Container{
+						{
+							Name:    "k3s-agent",
+							Image:   VNodeAgentImage,
+							Command: []string{"k3s"},
+							Args: []string{
+								"agent",
+								"--server=" + serverURL,
+								"--token=" + VNodeAgentToken(name),
+								"--node-name=$(NODE_NAME)",
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name: "NODE_NAME",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											FieldPath: "metadata.name",
+										},
+									},
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: ptr.To(true),
+								RunAsUser:  ptr.To[int64](0),
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+									corev1.ResourceMemory: resource.MustParse("512Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("2Gi"),
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "k3s-data", MountPath: "/var/lib/rancher/k3s"},
+								{Name: "kubelet", MountPath: "/var/lib/kubelet"},
+								{Name: "cni-bin", MountPath: "/opt/cni/bin"},
+								{Name: "cni-conf", MountPath: "/etc/cni/net.d"},
+								{Name: "modules", MountPath: "/lib/modules", ReadOnly: true},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{Name: "k3s-data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{Name: "kubelet", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{Name: "cni-bin", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{Name: "cni-conf", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{
+							Name: "modules",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{Path: "/lib/modules"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if imagePullSecret != "" {
+		dep.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
+			{Name: imagePullSecret},
+		}
+	}
+
+	_, err := client.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{})
+	return err
+}
+
 // BuildIngress returns an Ingress resource for the virtual cluster.
 func BuildIngress(name, ns string, labels map[string]string, host, ingressClass string) *networkingv1.Ingress {
 	pathType := networkingv1.PathTypeImplementationSpecific
@@ -578,7 +741,7 @@ func BuildIngress(name, ns string, labels map[string]string, host, ingressClass 
 			Namespace: ns,
 			Labels:    labels,
 			Annotations: map[string]string{
-				"nginx.ingress.kubernetes.io/ssl-passthrough": "true",
+				"nginx.ingress.kubernetes.io/ssl-passthrough":  "true",
 				"nginx.ingress.kubernetes.io/backend-protocol": "HTTPS",
 			},
 		},

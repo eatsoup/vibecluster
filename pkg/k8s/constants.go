@@ -29,6 +29,16 @@ const (
 
 	// KubeconfigSecretSuffix is the suffix for kubeconfig secrets.
 	KubeconfigSecretSuffix = "-kubeconfig"
+
+	// EnvVNodeMode, when "true" on the syncer container, disables all
+	// workload sync loops. In vnode mode real workloads run inside the
+	// in-vcluster kubelet, not as siblings in the host namespace, so
+	// there is nothing for the flat syncer to reflect.
+	EnvVNodeMode = "VIBE_VNODE_MODE"
+
+	// VNodeAgentImage is the image used for the k3s-agent sidecar pod in
+	// vnode mode. Same image as the server so the agent binary is present.
+	VNodeAgentImage = K3sImage
 )
 
 // NamespaceName returns the namespace name for a virtual cluster.

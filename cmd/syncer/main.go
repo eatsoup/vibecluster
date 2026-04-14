@@ -33,6 +33,16 @@ func main() {
 		cancel()
 	}()
 
+	// In vnode mode (prototype, issue #27) there is a real in-vcluster
+	// kubelet, so the flat workload syncer and the kubelet shim are both
+	// unnecessary. Idle until signalled rather than exiting — the pod
+	// spec still lists this as a container and we want it to stay Ready.
+	if os.Getenv(k8s.EnvVNodeMode) == "true" {
+		fmt.Println("VIBE_VNODE_MODE=true: workload sync and kubelet shim disabled; idling.")
+		<-ctx.Done()
+		return
+	}
+
 	// Wait for k3s to be ready (kubeconfig file to appear)
 	vcKubeconfig := "/data/k3s/server/cred/admin.kubeconfig"
 	fmt.Printf("Waiting for k3s kubeconfig at %s...\n", vcKubeconfig)
