@@ -553,6 +553,13 @@ func buildK3sServerArgs(name, ns, exposeHost string, vnode bool) []string {
 		// vnode Deployment is. Leave flannel + network-policy + servicelb
 		// + coredns ON so NetworkPolicy and LoadBalancer Services work
 		// inside the virtual cluster without any syncer translation.
+		//
+		// Pin non-default pod/service CIDRs so the nested cluster doesn't
+		// collide with the host cluster (which on k3s also defaults to
+		// 10.42/16 and 10.43/16). Collision breaks pod egress because the
+		// host's flannel and the nested flannel both think they own the
+		// same subnet. Static values for the prototype — productization
+		// needs an allocator across multiple vclusters.
 		args := []string{
 			"server",
 			"--disable=traefik,metrics-server,local-storage",
@@ -561,6 +568,9 @@ func buildK3sServerArgs(name, ns, exposeHost string, vnode bool) []string {
 			"--disable-helm-controller",
 			"--token=" + VNodeAgentToken(name),
 			"--data-dir=/data/k3s",
+			"--cluster-cidr=10.244.0.0/16",
+			"--service-cidr=10.245.0.0/16",
+			"--cluster-dns=10.245.0.10",
 		}
 		return append(args, tlsSAN...)
 	}
@@ -641,11 +651,15 @@ func VNodeAgentToken(name string) string {
 // on issue #27 for why we are explicitly not doing that here.
 func createVNodeDeployment(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, imagePullSecret string) error {
 	depName := name + "-vnode"
-	depLabels := map[string]string{}
-	for k, v := range labels {
-		depLabels[k] = v
+	// Intentionally do NOT copy the base labels — the main Service and the
+	// headless Service select on `app: vibecluster`, so carrying that label
+	// here would make the API server Service load-balance between the k3s
+	// server pod and the vnode pod (which doesn't listen on 6443).
+	depLabels := map[string]string{
+		LabelManagedBy:              LabelManagedByValue,
+		LabelVClusterName:           name,
+		"vibecluster.dev/component": "vnode",
 	}
-	depLabels["vibecluster.dev/component"] = "vnode"
 
 	serverURL := "https://" + name + "." + ns + ".svc.cluster.local:" + fmt.Sprintf("%d", ServicePort)
 
@@ -662,6 +676,26 @@ func createVNodeDeployment(ctx context.Context, client kubernetes.Interface, nam
 				Spec: corev1.PodSpec{
 					ServiceAccountName:            "vc-" + name,
 					TerminationGracePeriodSeconds: ptr.To[int64](10),
+					// Nested containerd exhausts the host's default
+					// fs.inotify.max_user_instances (128 on most distros)
+					// almost immediately — the same issue kind/k3d document
+					// for running Kubernetes-in-Docker. Bump it on the host
+					// via a privileged init container so vibecluster carries
+					// its own prerequisite instead of requiring a host-side
+					// sysctl edit from the operator.
+					InitContainers: []corev1.Container{
+						{
+							Name:  "sysctl",
+							Image: VNodeAgentImage,
+							Command: []string{"sh", "-c",
+								"sysctl -w fs.inotify.max_user_instances=8192 && sysctl -w fs.inotify.max_user_watches=1048576",
+							},
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: ptr.To(true),
+								RunAsUser:  ptr.To[int64](0),
+							},
+						},
+					},
 					Containers: []corev1.Container{
 						{
 							Name:    "k3s-agent",
