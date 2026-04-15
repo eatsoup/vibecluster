@@ -50,6 +50,22 @@ func CreateVirtualCluster(ctx context.Context, client kubernetes.Interface, name
 		syncerImage = SyncerImage
 	}
 
+	// Allocate pod/service CIDRs for vnode mode before the namespace is
+	// created so the chosen values can be recorded as namespace annotations
+	// — that's what AllocateVNodeCIDRs reads to avoid collisions with
+	// existing vclusters on the same host.
+	var vnodeCIDRs VNodeCIDRs
+	if opts.VNode {
+		allocated, err := AllocateVNodeCIDRs(ctx, client)
+		if err != nil {
+			return fmt.Errorf("allocating vnode CIDRs: %w", err)
+		}
+		vnodeCIDRs = allocated
+		annotations[AnnotationPodCIDR] = vnodeCIDRs.Pod
+		annotations[AnnotationServiceCIDR] = vnodeCIDRs.Service
+		fmt.Printf("  Allocated CIDRs: pod=%s service=%s\n", vnodeCIDRs.Pod, vnodeCIDRs.Service)
+	}
+
 	// 1. Create namespace
 	fmt.Printf("  Creating namespace %s...\n", ns)
 	if err := createNamespace(ctx, client, ns, labels, annotations); err != nil {
@@ -95,7 +111,7 @@ func CreateVirtualCluster(ctx context.Context, client kubernetes.Interface, name
 
 	// 7. Create statefulset
 	fmt.Printf("  Creating StatefulSet...\n")
-	if err := createStatefulSet(ctx, client, name, ns, labels, syncerImage, opts.ImagePullSecret, opts.ExposeHost, opts.VNode); err != nil {
+	if err := createStatefulSet(ctx, client, name, ns, labels, syncerImage, opts.ImagePullSecret, opts.ExposeHost, opts.VNode, vnodeCIDRs); err != nil {
 		return fmt.Errorf("creating statefulset: %w", err)
 	}
 
@@ -388,8 +404,8 @@ func createServices(ctx context.Context, client kubernetes.Interface, name, ns s
 	return nil
 }
 
-func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, syncerImage, imagePullSecret string, exposeHost string, vnode bool) error {
-	k3sArgs := buildK3sServerArgs(name, ns, exposeHost, vnode)
+func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, syncerImage, imagePullSecret string, exposeHost string, vnode bool, vnodeCIDRs VNodeCIDRs) error {
+	k3sArgs := buildK3sServerArgs(name, ns, exposeHost, vnode, vnodeCIDRs)
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -538,7 +554,7 @@ func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, n
 // policy, servicelb, coredns) because a real agent Deployment is joining the
 // cluster and will run those components — see createVNodeDeployment and
 // issue #27.
-func buildK3sServerArgs(name, ns, exposeHost string, vnode bool) []string {
+func buildK3sServerArgs(name, ns, exposeHost string, vnode bool, vnodeCIDRs VNodeCIDRs) []string {
 	tlsSAN := []string{
 		"--tls-san=" + name + "." + ns + ".svc.cluster.local",
 		"--tls-san=" + name + "." + ns + ".svc",
@@ -554,12 +570,10 @@ func buildK3sServerArgs(name, ns, exposeHost string, vnode bool) []string {
 		// + coredns ON so NetworkPolicy and LoadBalancer Services work
 		// inside the virtual cluster without any syncer translation.
 		//
-		// Pin non-default pod/service CIDRs so the nested cluster doesn't
-		// collide with the host cluster (which on k3s also defaults to
-		// 10.42/16 and 10.43/16). Collision breaks pod egress because the
-		// host's flannel and the nested flannel both think they own the
-		// same subnet. Static values for the prototype — productization
-		// needs an allocator across multiple vclusters.
+		// Pod/service CIDRs come from AllocateVNodeCIDRs so multiple
+		// vclusters on one host don't collide with each other or with the
+		// host k3s defaults (10.42/16 and 10.43/16). Collision breaks pod
+		// egress because both flannels think they own the same subnet.
 		args := []string{
 			"server",
 			"--disable=traefik,metrics-server,local-storage",
@@ -568,9 +582,9 @@ func buildK3sServerArgs(name, ns, exposeHost string, vnode bool) []string {
 			"--disable-helm-controller",
 			"--token=" + VNodeAgentToken(name),
 			"--data-dir=/data/k3s",
-			"--cluster-cidr=10.244.0.0/16",
-			"--service-cidr=10.245.0.0/16",
-			"--cluster-dns=10.245.0.10",
+			"--cluster-cidr=" + vnodeCIDRs.Pod,
+			"--service-cidr=" + vnodeCIDRs.Service,
+			"--cluster-dns=" + vnodeCIDRs.ClusterDNS,
 		}
 		return append(args, tlsSAN...)
 	}

@@ -9,6 +9,13 @@ const (
 	LabelVClusterName = "vibecluster.dev/name"
 	// AnnotationCreated is the annotation for creation timestamp.
 	AnnotationCreated = "vibecluster.dev/created"
+	// AnnotationPodCIDR records the pod /16 allocated to a vnode-mode
+	// virtual cluster. The allocator reads this annotation across existing
+	// vc-* namespaces to pick a free slot for the next cluster.
+	AnnotationPodCIDR = "vibecluster.dev/pod-cidr"
+	// AnnotationServiceCIDR records the service /16 allocated to a
+	// vnode-mode virtual cluster. Read by the allocator the same way.
+	AnnotationServiceCIDR = "vibecluster.dev/service-cidr"
 
 	// K3sImage is the default k3s container image.
 	K3sImage = "rancher/k3s:v1.28.5-k3s1"
