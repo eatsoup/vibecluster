@@ -1,53 +1,88 @@
-# vibecluster
+<p align="center">
+  <img src="vibecluster.png" alt="vibecluster" width="200" />
+</p>
 
-Lightweight virtual Kubernetes clusters running inside a host cluster.
+<h1 align="center">vibecluster</h1>
 
-vibecluster creates isolated virtual clusters by deploying [k3s](https://k3s.io) as a StatefulSet in a dedicated namespace. Each virtual cluster gets its own API server, control plane, and resource isolation — while sharing the underlying host cluster's compute.
+<p align="center">
+  Lightweight virtual Kubernetes clusters inside a host cluster.
+</p>
 
-## How it works
+<p align="center">
+  <a href="#quick-start">Quick Start</a> &middot;
+  <a href="#installation">Installation</a> &middot;
+  <a href="#cli-reference">CLI Reference</a> &middot;
+  <a href="#operator">Operator</a> &middot;
+  <a href="#development">Development</a>
+</p>
+
+---
+
+vibecluster creates isolated virtual clusters by deploying [k3s](https://k3s.io) as a StatefulSet in a dedicated namespace. Each virtual cluster gets its own API server, control plane, and resource isolation -- while sharing the underlying host cluster's compute.
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│ Host Cluster                                    │
-│                                                 │
-│  ┌───────────────── vc-mycluster ─────────────┐ │
-│  │ Namespace                                  │ │
-│  │                                            │ │
-│  │  ┌──────────────────────────────────────┐  │ │
-│  │  │ StatefulSet: mycluster               │  │ │
-│  │  │                                      │  │ │
-│  │  │  ┌────────────┐  ┌───────────────┐   │  │ │
-│  │  │  │ k3s server │  │ syncer        │   │  │ │
-│  │  │  │ (API, etcd,│  │ (pods, svc,   │   │  │ │
-│  │  │  │  ctrl-mgr) │  │  cm, secrets) │   │  │ │
-│  │  │  └────────────┘  └───────────────┘   │  │ │
-│  │  └──────────────────────────────────────┘  │ │
-│  │                                            │ │
-│  │  Service: mycluster (ClusterIP :443)       │ │
-│  │  RBAC: ServiceAccount, ClusterRole         │ │
-│  │  Synced resources: pods, svc, cm, secrets  │ │
-│  └────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│ Host Cluster                                     │
+│                                                  │
+│  ┌──────────────── vc-mycluster ───────────────┐ │
+│  │ Namespace                                   │ │
+│  │                                             │ │
+│  │  ┌───────────────────────────────────────┐  │ │
+│  │  │ StatefulSet: mycluster                │  │ │
+│  │  │                                       │  │ │
+│  │  │  ┌────────────┐  ┌────────────────┐   │  │ │
+│  │  │  │ k3s server │  │ syncer sidecar │   │  │ │
+│  │  │  │ (API, etcd,│  │ (pods, svc,    │   │  │ │
+│  │  │  │  ctrl-mgr) │  │  cm, secrets)  │   │  │ │
+│  │  │  └────────────┘  └────────────────┘   │  │ │
+│  │  └───────────────────────────────────────┘  │ │
+│  │                                             │ │
+│  │  Service (ClusterIP :443)                   │ │
+│  │  RBAC: ServiceAccount + ClusterRole         │ │
+│  └─────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────┘
 ```
 
-**Syncer** runs as a sidecar alongside k3s. It watches the virtual cluster and syncs resources bidirectionally:
-- **Virtual -> Host:** Pods, Services, ConfigMaps, Secrets (name-translated into the host namespace)
-- **Host -> Virtual:** Nodes (so workloads can be scheduled)
+The **syncer** watches the virtual cluster and syncs resources bidirectionally:
 
-## Install
+- **Virtual to Host** -- Pods, Services, ConfigMaps, Secrets (name-translated into the host namespace)
+- **Host to Virtual** -- Nodes (so virtual workloads can be scheduled)
 
-### From release
+Resources created inside the virtual cluster appear in the host namespace with translated names:
+
+| Virtual Cluster | Host Cluster |
+|---|---|
+| `default/my-pod` | `vc-mycluster/mycluster-x-my-pod-x-default` |
+| `default/my-configmap` | `vc-mycluster/mycluster-x-my-configmap-x-default` |
+
+## Quick Start
+
+```bash
+# Create a virtual cluster
+vibecluster create mycluster
+
+# Use it
+kubectl get nodes
+kubectl create deployment nginx --image=nginx
+
+# Tear it down
+vibecluster delete mycluster
+```
+
+## Installation
+
+### Binary releases
 
 ```bash
 # Linux amd64
 curl -L -o vibecluster https://github.com/eatsoup/vibecluster/releases/latest/download/vibecluster-linux-amd64
-chmod +x vibecluster
-sudo mv vibecluster /usr/local/bin/
+chmod +x vibecluster && sudo mv vibecluster /usr/local/bin/
 
 # macOS arm64 (Apple Silicon)
 curl -L -o vibecluster https://github.com/eatsoup/vibecluster/releases/latest/download/vibecluster-darwin-arm64
-chmod +x vibecluster
-sudo mv vibecluster /usr/local/bin/
+chmod +x vibecluster && sudo mv vibecluster /usr/local/bin/
 ```
 
 ### From source
@@ -55,65 +90,68 @@ sudo mv vibecluster /usr/local/bin/
 ```bash
 git clone https://github.com/eatsoup/vibecluster.git
 cd vibecluster
-make build
-# Binary at ./bin/vibecluster
+make build        # Binary at ./bin/vibecluster
 ```
 
-## Usage
+## CLI Reference
 
-### Create a virtual cluster
+### `vibecluster create`
+
+Creates a new virtual cluster: namespace, k3s StatefulSet, RBAC, services, and a kubeconfig.
 
 ```bash
 vibecluster create mycluster
 ```
 
-This will:
-1. Create namespace `vc-mycluster`
-2. Deploy k3s + syncer as a StatefulSet
-3. Set up RBAC and services
-4. Wait for the cluster to be ready
-5. Write a kubeconfig file (with the in-cluster service URL by default)
+| Flag | Default | Description |
+|---|---|---|
+| `--connect` | `true` | Auto-connect after creation |
+| `--timeout` | `5m` | Readiness timeout |
+| `--print` | `false` | Print kubeconfig to stdout instead of writing it |
+| `--mode` | `auto` | `auto`, `legacy` (raw manifests), or `operator` (require CRD) |
+| `--cr-namespace` | `default` | Namespace for the `VirtualCluster` CR (operator mode) |
+| `--cpu` | -- | CPU budget, e.g. `4` or `500m` (creates a ResourceQuota) |
+| `--memory` | -- | Memory budget, e.g. `8Gi` |
+| `--storage` | -- | PVC storage budget, e.g. `50Gi` |
+| `--pods` | `0` | Max pod count (`0` = unlimited) |
+| `--vnode` | `false` | Enable nested data-plane mode |
 
-`create` no longer starts a port-forward automatically. To reach the API server from your machine, either expose the cluster persistently or run an ephemeral port-forward — see [Expose](#expose-a-virtual-cluster).
+When any resource limit is set, a `LimitRange` is also installed so that pods without explicit requests are still admissible under the quota.
 
-### Connect to an existing virtual cluster
+### `vibecluster connect`
+
+Writes a kubeconfig for an existing virtual cluster.
 
 ```bash
-# Write kubeconfig and keep port-forward running
 vibecluster connect mycluster
-
-# Print kubeconfig to stdout
 vibecluster connect mycluster --print
-
-# Write to a specific file
 vibecluster connect mycluster --kubeconfig ./my-kubeconfig.yaml
 ```
 
-### Expose a virtual cluster
+| Flag | Default | Description |
+|---|---|---|
+| `--server` | (auto) | Override API server address |
+| `--print` | `false` | Print kubeconfig to stdout |
+| `--kubeconfig` | `~/.kube/config` | Output file |
+
+### `vibecluster expose`
+
+Makes a virtual cluster reachable from outside the host cluster.
 
 ```bash
-# Ephemeral port-forward — runs in the foreground until Ctrl+C
+# Ephemeral port-forward (foreground, Ctrl+C to stop)
 vibecluster expose mycluster --temp
 
 # Persistent LoadBalancer
 vibecluster expose mycluster --type LoadBalancer
 
-# Persistent Ingress
+# Persistent Ingress with TLS-SAN
 vibecluster expose mycluster --type Ingress --host vc.example.com
 ```
 
-`expose` (without `--temp`) waits for the external address to materialise and writes a fresh kubeconfig pointing at it. For `--type Ingress`, the host is added to the k3s server certificate's TLS-SAN list, so the kubeconfig validates normally. For `--type LoadBalancer`, the assigned IP/hostname is **not** in the server certificate, so the generated kubeconfig is written with `insecure-skip-tls-verify: true`. If you need a verifying connection over a LoadBalancer, add the address to TLS-SANs yourself (e.g. by patching the StatefulSet args) and re-run `vibecluster connect`.
+For `--type Ingress`, the host is added to the k3s TLS-SAN list so the kubeconfig validates normally. For `--type LoadBalancer`, the generated kubeconfig uses `insecure-skip-tls-verify: true` since the assigned address is not in the server certificate.
 
-### Use the virtual cluster
-
-```bash
-# With the context set by connect/create:
-kubectl get nodes
-kubectl create deployment nginx --image=nginx
-kubectl get pods
-```
-
-### List virtual clusters
+### `vibecluster list`
 
 ```bash
 vibecluster list
@@ -125,153 +163,100 @@ mycluster   vc-mycluster   Running   legacy     2026-04-09T19:27:30Z
 dev         vc-dev         Running   operator   2026-04-09T20:15:00Z
 ```
 
-The `MODE` column shows whether the cluster is managed by a `VirtualCluster` CR (`operator`) or by raw manifests created by the CLI (`legacy`). When the operator is installed, `list` also surfaces CRs whose backing namespace has not yet been created, with status `Pending`.
-
-### View syncer/k3s logs
+### `vibecluster logs`
 
 ```bash
-# Syncer logs (default)
-vibecluster logs mycluster
-
-# k3s logs
-vibecluster logs mycluster -c k3s
-
-# Follow
-vibecluster logs mycluster -f
+vibecluster logs mycluster          # syncer logs (default)
+vibecluster logs mycluster -c k3s   # k3s server logs
+vibecluster logs mycluster -f       # follow
 ```
 
-### Delete a virtual cluster
+### `vibecluster delete`
 
 ```bash
 vibecluster delete mycluster
 ```
 
-## Resource syncing
-
-Resources created in the virtual cluster are synced to the host namespace with translated names:
-
-| Virtual Cluster | Host Cluster |
-|---|---|
-| `default/my-configmap` | `vc-mycluster/mycluster-x-my-configmap-x-default` |
-| `default/my-pod` | `vc-mycluster/mycluster-x-my-pod-x-default` |
-
-Synced resources on the host are labeled with:
-- `vibecluster.dev/synced-from` — source virtual cluster name
-- `vibecluster.dev/virtual-name` — original resource name
-- `vibecluster.dev/virtual-namespace` — original namespace
-
-## Configuration
-
 ### Global flags
 
 | Flag | Description |
 |---|---|
-| `--context` | Kubernetes context to use for the host cluster |
+| `--context` | Kubernetes context for the host cluster |
 
-### Create flags
+## VNode Mode
 
-| Flag | Default | Description |
-|---|---|---|
-| `--connect` | `true` | Auto-connect after creation |
-| `--timeout` | `5m` | Timeout waiting for readiness |
-| `--print` | `false` | Print kubeconfig to stdout |
-| `--mode` | `auto` | Creation mode: `auto` (use the operator if installed, otherwise raw manifests), `legacy` (always raw manifests), or `operator` (require the CRD) |
-| `--cr-namespace` | `default` | Namespace to create the `VirtualCluster` CR in (operator mode only) |
-| `--cpu` | _(unset)_ | Total CPU budget for the virtual cluster (e.g. `4`, `500m`). Enforced via a namespace `ResourceQuota`. The k3s control plane counts against this. |
-| `--memory` | _(unset)_ | Total memory budget for the virtual cluster (e.g. `8Gi`). Enforced via a namespace `ResourceQuota`. The k3s control plane counts against this. |
-| `--storage` | _(unset)_ | Total persistent storage budget across all PVCs (e.g. `50Gi`). Enforced via a namespace `ResourceQuota`. |
-| `--pods` | `0` | Maximum pod count in the virtual cluster (`0` = unlimited). |
-| `--vnode` | `false` | Enable nested data-plane mode (real NetworkPolicy + LoadBalancer). Requires privileged pods on the host. |
+By default, virtual clusters use a flat syncer that translates workloads into the host namespace. This is lightweight but cannot enforce `NetworkPolicy` or provision in-cluster `LoadBalancer` Services -- there is no real CNI inside the virtual cluster.
 
-When any of `--cpu`, `--memory`, `--storage`, or `--pods` is set, vibecluster also installs a `LimitRange` in the `vc-<name>` namespace that supplies default container CPU/memory requests and limits — without it, workloads created without explicit resource requests would be rejected by the matching ResourceQuota at admission time.
-
-When `vibecluster create` runs in operator mode, the CLI submits a `VirtualCluster` CR for the operator to reconcile rather than creating manifests directly. The `--expose`, `--expose-host`, `--expose-ingress-class`, and `--vnode` flags are translated into the CR's spec fields, so the operator stands up the corresponding resources as part of reconciliation. `--image-pull-secret` is the only legacy-only flag — the CRD does not yet model it, so it's ignored in operator mode (a notice is printed).
-
-### VNode mode (nested data plane)
-
-By default, virtual clusters use a flat syncer that translates workloads to the host namespace. This approach is lightweight but cannot enforce `NetworkPolicy` or run in-vcluster `LoadBalancer` Services, because there is no real CNI or kube-router inside the virtual cluster.
-
-**VNode mode** solves this by running a privileged k3s agent pod that joins the virtual API server as a real node. The agent brings flannel, kube-router, and klipper-lb, so `NetworkPolicy` rules and `LoadBalancer` Services work the same way they do on a standalone cluster.
+VNode mode solves this by running a privileged k3s agent pod that joins the virtual API server as a real node, bringing flannel, kube-router, and klipper-lb with it.
 
 ```bash
-# CLI
 vibecluster create mycluster --vnode
-
-# Operator CR
-kubectl apply -f - <<EOF
-apiVersion: vibecluster.dev/v1alpha1
-kind: VirtualCluster
-metadata:
-  name: mycluster
-spec:
-  vnode: true
-EOF
 ```
-
-**Requirements:** The vnode agent pod needs `privileged: true` on the host cluster. Only enable vnode mode where that security trade-off is acceptable.
 
 Each vnode cluster is allocated a unique pod and service CIDR (`/16` ranges) so multiple vnode clusters on the same host do not collide.
 
-### Connect flags
+**Requirement:** The vnode agent pod runs as `privileged: true` on the host cluster.
 
-| Flag | Default | Description |
-|---|---|---|
-| `--server` | (auto) | Override API server address |
-| `--print` | `false` | Print kubeconfig to stdout |
-| `--kubeconfig` | `~/.kube/config` | Kubeconfig output file |
+## Operator
 
-## Operator / GitOps
+vibecluster ships a Kubernetes operator for declarative, GitOps-friendly virtual cluster management.
 
-vibecluster can be deployed as a **Kubernetes operator**, enabling GitOps workflows where virtual clusters are managed declaratively via `VirtualCluster` custom resources. This integrates seamlessly with tools like [ArgoCD](https://argo-cd.readthedocs.io/) and [Flux](https://fluxcd.io/).
-
-### Deploying the operator
-
-You can easily install the operator and CRDs directly using the CLI:
+### Install
 
 ```bash
 vibecluster operator install
 ```
 
-This command will automatically create the CRD, namespace, service accounts, RBAC, and deploy the operator container.
+Or with manifests directly:
 
-To remove the operator and its custom resources:
+```bash
+kubectl apply -k https://github.com/eatsoup/vibecluster/config/operator
+```
+
+To uninstall:
 
 ```bash
 vibecluster operator uninstall
 ```
 
-Alternatively, you can manually install the manifests using standard `kubectl` commands:
-
-```bash
-# Using kustomize (includes CRD + RBAC + Deployment)
-kubectl apply -k https://github.com/eatsoup/vibecluster/config/operator
-
-# Or manually
-kubectl apply -f config/crd/vibecluster.dev_virtualclusters.yaml
-kubectl apply -f config/operator/rbac.yaml
-kubectl apply -f config/operator/deployment.yaml
-```
-
-### Create a VirtualCluster
+### VirtualCluster resource
 
 ```yaml
 apiVersion: vibecluster.dev/v1alpha1
 kind: VirtualCluster
 metadata:
   name: dev-cluster
-  namespace: default
 spec:
-  # All optional — sensible defaults applied
   k3sImage: "rancher/k3s:v1.28.5-k3s1"
   syncerImage: "ghcr.io/eatsoup/vibecluster/syncer:latest"
   storage: "5Gi"
+  expose:
+    type: Ingress
+    host: dev.vc.example.com
+    ingressClass: nginx
+  resources:
+    cpu: "4"
+    memory: "8Gi"
+    storage: "50Gi"
+    pods: 50
+  vnode: false
 ```
 
-```bash
-kubectl apply -f my-cluster.yaml
-```
+| Field | Default | Description |
+|---|---|---|
+| `spec.k3sImage` | `rancher/k3s:v1.28.5-k3s1` | k3s container image |
+| `spec.syncerImage` | `ghcr.io/eatsoup/vibecluster/syncer:latest` | Syncer sidecar image |
+| `spec.storage` | `5Gi` | PV size for k3s data |
+| `spec.expose.type` | -- | `LoadBalancer` or `Ingress` |
+| `spec.expose.host` | -- | External hostname (required for Ingress) |
+| `spec.expose.ingressClass` | -- | IngressClassName for Ingress |
+| `spec.resources.cpu` | -- | CPU budget |
+| `spec.resources.memory` | -- | Memory budget |
+| `spec.resources.storage` | -- | PVC storage budget |
+| `spec.resources.pods` | -- | Max pod count |
+| `spec.vnode` | `false` | Enable nested data-plane mode |
 
-### Check status
+### Status
 
 ```bash
 kubectl get virtualclusters
@@ -282,79 +267,19 @@ NAME          PHASE     READY   NAMESPACE         AGE
 dev-cluster   Running   true    vc-dev-cluster    5m
 ```
 
-### VirtualCluster spec fields
-
-| Field | Default | Description |
-|---|---|---|
-| `k3sImage` | `rancher/k3s:v1.28.5-k3s1` | k3s container image |
-| `syncerImage` | `ghcr.io/eatsoup/vibecluster/syncer:latest` | Syncer sidecar image |
-| `storage` | `5Gi` | Persistent volume size for k3s data |
-| `expose.type` | _(unset)_ | `LoadBalancer` or `Ingress`. When unset the cluster is only reachable via its in-cluster ClusterIP service. |
-| `expose.host` | _(unset)_ | External hostname. Required for `Ingress`; also added to the k3s server certificate's TLS-SAN list so kubeconfigs validate. |
-| `expose.ingressClass` | _(unset)_ | `IngressClassName` to use when `expose.type` is `Ingress`. |
-| `resources.cpu` | _(unset)_ | Total CPU budget (e.g. `4`, `500m`). Enforced via a namespace `ResourceQuota`. Includes the k3s control plane. |
-| `resources.memory` | _(unset)_ | Total memory budget (e.g. `8Gi`). Enforced via a namespace `ResourceQuota`. Includes the k3s control plane. |
-| `resources.storage` | _(unset)_ | Total persistent storage budget across all PVCs (e.g. `50Gi`). Enforced via a namespace `ResourceQuota`. |
-| `resources.pods` | _(unset)_ | Maximum pod count. |
-| `vnode` | `false` | Enable nested data-plane mode (real NetworkPolicy + LoadBalancer). Requires privileged pods on the host. |
-
-Example with persistent Ingress exposure:
-
-```yaml
-apiVersion: vibecluster.dev/v1alpha1
-kind: VirtualCluster
-metadata:
-  name: dev-cluster
-  namespace: default
-spec:
-  expose:
-    type: Ingress
-    host: dev.vc.example.com
-    ingressClass: nginx
-```
-
-Example with per-tenant resource limits:
-
-```yaml
-apiVersion: vibecluster.dev/v1alpha1
-kind: VirtualCluster
-metadata:
-  name: tenant-a
-  namespace: default
-spec:
-  resources:
-    cpu: "4"
-    memory: "8Gi"
-    storage: "50Gi"
-    pods: 50
-```
-
-When `spec.resources` is set, the operator installs a `ResourceQuota` and a `LimitRange` in the `vc-<name>` namespace. The `LimitRange` provides default container CPU/memory requests and limits so that workloads created inside the virtual cluster without explicit resource requests are still admissible under the quota.
-
-### VirtualCluster status fields
-
-| Field | Description |
+| Status field | Description |
 |---|---|
 | `phase` | `Pending`, `Running`, `Failed`, or `Deleting` |
-| `ready` | `true` when StatefulSet has ready replicas |
-| `message` | Human-readable status message |
-| `namespace` | Host namespace (e.g., `vc-dev-cluster`) |
+| `ready` | `true` when the StatefulSet has ready replicas |
+| `message` | Human-readable detail |
+| `namespace` | Host namespace (`vc-<name>`) |
 | `observedGeneration` | Last reconciled generation |
 
-### Delete a VirtualCluster
+### GitOps integration
 
-```bash
-kubectl delete virtualcluster dev-cluster
-```
-
-The operator will clean up the namespace, RBAC, and all associated resources.
-
-### ArgoCD / Flux integration
-
-Store your `VirtualCluster` manifests in a Git repository and point your GitOps tool at them:
+Store `VirtualCluster` manifests in Git and point ArgoCD or Flux at them:
 
 ```yaml
-# argocd-app.yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -375,38 +300,16 @@ spec:
 ## Development
 
 ```bash
-# Build CLI
-make build
-
-# Build syncer image
-make syncer-image
-
-# Push syncer image
-make syncer-push
-
-# Build operator
-make build-operator
-
-# Build operator image
-make operator-image
-
-# Push operator image
-make operator-push
-
-# Install CRD
-make install-crd
-
-# Deploy operator (CRD + RBAC + Deployment)
-make deploy-operator
-
-# Undeploy operator
-make undeploy-operator
-
-# Run tests
-make test
+make build              # Build CLI
+make build-syncer       # Build syncer binary
+make build-operator     # Build operator binary
+make syncer-image       # Build syncer container image
+make operator-image     # Build operator container image
+make test               # Run tests
+make deploy-operator    # Install CRD + deploy operator
+make undeploy-operator  # Remove operator
 ```
 
 ## License
 
 [MIT](LICENSE)
-
