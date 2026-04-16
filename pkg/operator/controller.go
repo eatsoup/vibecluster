@@ -166,6 +166,7 @@ func (r *VirtualClusterReconciler) buildOptions(vc *vibeclusterv1alpha1.VirtualC
 		}
 	}
 	opts.VNode = vc.Spec.VNode
+	opts.Nodes = vc.Spec.Nodes
 
 	return opts
 }
@@ -496,31 +497,52 @@ func (r *VirtualClusterReconciler) ensureIngress(ctx context.Context, opts k8s.B
 	return nil
 }
 
-// ensureVNodeDeployment creates or updates the vnode agent Deployment when
-// vnode mode is enabled. When vnode is disabled, any pre-existing vnode
-// Deployment is removed.
+// ensureVNodeDeployment creates or updates the vnode agent StatefulSet
+// (and its backing headless Service) when vnode mode is enabled. When
+// vnode is disabled, any pre-existing vnode resources are removed.
+//
+// Replica count is reconciled in-place so changing spec.nodes on a live CR
+// scales the vnode StatefulSet without recreating the agents.
 func (r *VirtualClusterReconciler) ensureVNodeDeployment(ctx context.Context, opts *k8s.BuilderOptions) error {
-	depName := opts.Name + "-vnode"
+	stsName := k8s.VNodeName(opts.Name)
 
 	if !opts.VNode {
-		// Clean up if a previous reconcile created one.
-		existing := &appsv1.Deployment{}
-		err := r.Get(ctx, types.NamespacedName{Name: depName, Namespace: opts.Namespace}, existing)
-		if errors.IsNotFound(err) {
-			return nil
-		}
-		if err != nil {
+		// Clean up if a previous reconcile created one. Try both the new
+		// StatefulSet and the old Deployment name so CRs flipped off vnode
+		// after upgrading from v0.8.0 still get cleaned up.
+		if err := r.deleteIfExists(ctx, &appsv1.StatefulSet{}, stsName, opts.Namespace, "vnode statefulset"); err != nil {
 			return err
 		}
-		if err := r.Delete(ctx, existing); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("deleting stale vnode deployment: %w", err)
+		if err := r.deleteIfExists(ctx, &appsv1.Deployment{}, stsName, opts.Namespace, "vnode deployment"); err != nil {
+			return err
+		}
+		if err := r.deleteIfExists(ctx, &corev1.Service{}, stsName, opts.Namespace, "vnode headless service"); err != nil {
+			return err
 		}
 		return nil
 	}
 
-	desired := k8s.BuildVNodeDeployment(*opts)
-	existing := &appsv1.Deployment{}
-	err := r.Get(ctx, types.NamespacedName{Name: depName, Namespace: opts.Namespace}, existing)
+	// Headless Service for the StatefulSet's stable pod DNS.
+	desiredSvc := k8s.BuildVNodeHeadlessService(*opts)
+	existingSvc := &corev1.Service{}
+	switch err := r.Get(ctx, types.NamespacedName{Name: desiredSvc.Name, Namespace: desiredSvc.Namespace}, existingSvc); {
+	case errors.IsNotFound(err):
+		if err := r.Create(ctx, desiredSvc); err != nil {
+			return fmt.Errorf("creating vnode headless service: %w", err)
+		}
+	case err != nil:
+		return err
+	}
+
+	// If an older Deployment exists from v0.8.0, remove it so the new
+	// StatefulSet can own the name.
+	if err := r.deleteIfExists(ctx, &appsv1.Deployment{}, stsName, opts.Namespace, "legacy vnode deployment"); err != nil {
+		return err
+	}
+
+	desired := k8s.BuildVNodeStatefulSet(*opts)
+	existing := &appsv1.StatefulSet{}
+	err := r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: opts.Namespace}, existing)
 	if errors.IsNotFound(err) {
 		return r.Create(ctx, desired)
 	}
@@ -528,8 +550,13 @@ func (r *VirtualClusterReconciler) ensureVNodeDeployment(ctx context.Context, op
 		return err
 	}
 
-	// Reconcile the agent image.
 	needsUpdate := false
+	// Reconcile replica count so spec.nodes changes scale in place.
+	if existing.Spec.Replicas == nil || *existing.Spec.Replicas != *desired.Spec.Replicas {
+		existing.Spec.Replicas = desired.Spec.Replicas
+		needsUpdate = true
+	}
+	// Reconcile the agent image.
 	for i, c := range existing.Spec.Template.Spec.Containers {
 		for _, dc := range desired.Spec.Template.Spec.Containers {
 			if c.Name == dc.Name && c.Image != dc.Image {
@@ -540,6 +567,21 @@ func (r *VirtualClusterReconciler) ensureVNodeDeployment(ctx context.Context, op
 	}
 	if needsUpdate {
 		return r.Update(ctx, existing)
+	}
+	return nil
+}
+
+// deleteIfExists deletes obj at the given name/namespace if it exists,
+// swallowing NotFound. Used to clean up stale resources across mode/version
+// transitions.
+func (r *VirtualClusterReconciler) deleteIfExists(ctx context.Context, obj client.Object, name, namespace, what string) error {
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, obj); errors.IsNotFound(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := r.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("deleting stale %s: %w", what, err)
 	}
 	return nil
 }

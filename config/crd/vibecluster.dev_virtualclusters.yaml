@@ -85,6 +85,12 @@ spec:
                   description: VNode enables nested data-plane mode. A privileged k3s-agent pod joins the virtual API server and runs real flannel, kube-router, and klipper-lb so NetworkPolicy and in-vcluster LoadBalancer Services are enforced by real controllers. Requires privileged pods on the host.
                   type: boolean
                   default: false
+                nodes:
+                  description: Nodes is the number of virtual worker nodes (vnode agent pods) to run. Only meaningful when vnode is true — in non-vnode mode there is no real kubelet to scale. Each extra node is a privileged pod costing ~200m CPU / 512Mi–2Gi memory.
+                  type: integer
+                  format: int32
+                  minimum: 1
+                  default: 1
                 resources:
                   description: Resources caps the total resources the virtual cluster can consume on the host. The k3s control plane's own usage counts against these caps.
                   type: object

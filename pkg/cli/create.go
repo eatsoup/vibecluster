@@ -29,6 +29,7 @@ type createOptions struct {
 	storage            string
 	pods               int32
 	vnode              bool
+	nodes              int32
 }
 
 func newCreateCommand() *cobra.Command {
@@ -60,6 +61,7 @@ func newCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.storage, "storage", "", "total persistent storage budget across all PVCs (e.g. 50Gi); enforced via a namespace ResourceQuota.")
 	cmd.Flags().Int32Var(&opts.pods, "pods", 0, "maximum pod count in the virtual cluster (0 = unlimited).")
 	cmd.Flags().BoolVar(&opts.vnode, "vnode", false, "run a nested k3s agent pod so NetworkPolicy and LoadBalancer work inside the virtual cluster. Requires privileged pods on the host.")
+	cmd.Flags().Int32Var(&opts.nodes, "nodes", 1, "number of virtual worker nodes (vnode agents). Only valid with --vnode. Each extra node is a privileged pod, so scale deliberately.")
 
 	return cmd
 }
@@ -79,6 +81,13 @@ func resourceLimitsFromOpts(opts *createOptions) *k8s.ResourceLimits {
 }
 
 func runCreate(name string, opts *createOptions) error {
+	if opts.nodes < 1 {
+		return fmt.Errorf("--nodes must be >= 1")
+	}
+	if opts.nodes > 1 && !opts.vnode {
+		return fmt.Errorf("--nodes > 1 requires --vnode (non-vnode mode has no per-vcluster kubelet to scale)")
+	}
+
 	client, restConfig, err := k8s.NewClient(kubeContext)
 	if err != nil {
 		return err
@@ -99,6 +108,7 @@ func runCreate(name string, opts *createOptions) error {
 		spec := k8s.VirtualClusterCRSpec{
 			SyncerImage: opts.syncerImage,
 			VNode:       opts.vnode,
+			Nodes:       opts.nodes,
 		}
 		if opts.exposeType != "" {
 			spec.Expose = &k8s.VirtualClusterCRExpose{
@@ -127,6 +137,7 @@ func runCreate(name string, opts *createOptions) error {
 		ExposeHost:         opts.exposeHost,
 		Resources:          resourceLimitsFromOpts(opts),
 		VNode:              opts.vnode,
+		Nodes:              opts.nodes,
 	}
 
 	fmt.Printf("Creating virtual cluster %q...\n", name)

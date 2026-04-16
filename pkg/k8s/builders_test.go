@@ -190,6 +190,63 @@ func TestBuildLimitRange_HasDefaultsForContainer(t *testing.T) {
 	}
 }
 
+func TestBuildVNodeStatefulSet_DefaultReplicasIsOne(t *testing.T) {
+	opts := DefaultBuilderOptions("vc-vn1")
+	opts.VNode = true
+	sts := BuildVNodeStatefulSet(opts)
+	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 1 {
+		t.Errorf("Replicas = %v, want 1 (default when Nodes unset)", sts.Spec.Replicas)
+	}
+	if sts.Spec.ServiceName != "vc-vn1-vnode" {
+		t.Errorf("ServiceName = %q, want vc-vn1-vnode", sts.Spec.ServiceName)
+	}
+}
+
+func TestBuildVNodeStatefulSet_HonorsNodesCount(t *testing.T) {
+	opts := DefaultBuilderOptions("vc-vn3")
+	opts.VNode = true
+	opts.Nodes = 3
+	sts := BuildVNodeStatefulSet(opts)
+	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 3 {
+		t.Fatalf("Replicas = %v, want 3", sts.Spec.Replicas)
+	}
+	// Parallel so 3 privileged agent boots don't serialize.
+	if sts.Spec.PodManagementPolicy != "Parallel" {
+		t.Errorf("PodManagementPolicy = %q, want Parallel", sts.Spec.PodManagementPolicy)
+	}
+	// Selector labels must not carry `app: vibecluster` — that would
+	// leak vnode pods into the API server Service's backend set.
+	if v, ok := sts.Spec.Selector.MatchLabels["app"]; ok {
+		t.Errorf("selector includes app=%q — vnode pods must NOT be selected by the main Service", v)
+	}
+}
+
+func TestBuildVNodeStatefulSet_ZeroNodesTreatedAsOne(t *testing.T) {
+	// Operator + legacy paths both send Nodes=0 when the user didn't set
+	// the field. The builder must default, not produce a 0-replica STS.
+	opts := DefaultBuilderOptions("vc-vnzero")
+	opts.VNode = true
+	opts.Nodes = 0
+	sts := BuildVNodeStatefulSet(opts)
+	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 1 {
+		t.Errorf("Replicas = %v, want 1 when Nodes=0", sts.Spec.Replicas)
+	}
+}
+
+func TestBuildVNodeHeadlessService_SelectsOnlyVNodePods(t *testing.T) {
+	opts := DefaultBuilderOptions("vc-vnhs")
+	svc := BuildVNodeHeadlessService(opts)
+	if svc.Spec.ClusterIP != "None" {
+		t.Errorf("ClusterIP = %q, want None (headless)", svc.Spec.ClusterIP)
+	}
+	if got := svc.Spec.Selector["vibecluster.dev/component"]; got != "vnode" {
+		t.Errorf("selector[component] = %q, want vnode", got)
+	}
+	if _, ok := svc.Spec.Selector["app"]; ok {
+		t.Error("vnode headless service must not select `app` — would collide with main API server Service selector")
+	}
+}
+
 func TestBuildStatefulSet_NoExposeHostNoExtraSAN(t *testing.T) {
 	opts := DefaultBuilderOptions("vc-nosan")
 	sts := BuildStatefulSet(opts)

@@ -240,6 +240,50 @@ func TestCreateVirtualClusterCR_NoExposeOmitsField(t *testing.T) {
 	}
 }
 
+func TestCreateVirtualClusterCR_NodesOnlySetWhenGreaterThanOne(t *testing.T) {
+	// Nodes=0 or Nodes=1 should omit the field so the CRD default applies
+	// and two separate clients can't disagree about "default means 1".
+	for _, n := range []int32{0, 1} {
+		scheme := runtime.NewScheme()
+		gvrToListKind := map[schema.GroupVersionResource]string{
+			VirtualClusterGVR: "VirtualClusterList",
+		}
+		dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind)
+		if err := createVirtualClusterCRWith(context.Background(), dyn, "n1", "default", VirtualClusterCRSpec{VNode: true, Nodes: n}); err != nil {
+			t.Fatalf("create CR: %v", err)
+		}
+		got, err := dyn.Resource(VirtualClusterGVR).Namespace("default").Get(context.Background(), "n1", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get CR: %v", err)
+		}
+		if _, found, _ := unstructured.NestedInt64(got.Object, "spec", "nodes"); found {
+			t.Errorf("Nodes=%d: spec.nodes should be omitted (let CRD default apply)", n)
+		}
+	}
+}
+
+func TestCreateVirtualClusterCR_NodesPopulatedWhenMulti(t *testing.T) {
+	scheme := runtime.NewScheme()
+	gvrToListKind := map[schema.GroupVersionResource]string{
+		VirtualClusterGVR: "VirtualClusterList",
+	}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind)
+	if err := createVirtualClusterCRWith(context.Background(), dyn, "multi", "default", VirtualClusterCRSpec{VNode: true, Nodes: 3}); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+	got, err := dyn.Resource(VirtualClusterGVR).Namespace("default").Get(context.Background(), "multi", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	n, found, _ := unstructured.NestedInt64(got.Object, "spec", "nodes")
+	if !found {
+		t.Fatal("spec.nodes missing")
+	}
+	if n != 3 {
+		t.Errorf("spec.nodes = %d, want 3", n)
+	}
+}
+
 func TestListVirtualClusterCRs_Empty(t *testing.T) {
 	dyn := newDynamicFake(t)
 	got, err := listVirtualClusterCRsWith(context.Background(), dyn)

@@ -155,3 +155,23 @@ func TestCreateVirtualCluster_VNodeAnnotatesCIDRs(t *testing.T) {
 		t.Errorf("second vcluster got the same service CIDR %q as the first — allocator collision", ns2.Annotations[AnnotationServiceCIDR])
 	}
 }
+
+func TestCreateVirtualCluster_VNodeNodesProducesStatefulSet(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ctx := context.Background()
+
+	if err := CreateVirtualCluster(ctx, client, "multi", CreateOptions{VNode: true, Nodes: 3}); err != nil {
+		t.Fatalf("CreateVirtualCluster failed: %v", err)
+	}
+
+	sts, err := client.AppsV1().StatefulSets("vc-multi").Get(ctx, "multi-vnode", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("vnode statefulset not created: %v", err)
+	}
+	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 3 {
+		t.Errorf("vnode STS replicas = %v, want 3", sts.Spec.Replicas)
+	}
+	if _, err := client.CoreV1().Services("vc-multi").Get(ctx, "multi-vnode", metav1.GetOptions{}); err != nil {
+		t.Errorf("vnode headless service not created: %v", err)
+	}
+}

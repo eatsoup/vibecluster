@@ -55,6 +55,8 @@ func TestCreateCommand_Flags(t *testing.T) {
 		{"memory", ""},
 		{"storage", ""},
 		{"pods", "0"},
+		{"vnode", "false"},
+		{"nodes", "1"},
 	}
 
 	for _, f := range flags {

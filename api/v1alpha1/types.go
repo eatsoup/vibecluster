@@ -45,6 +45,15 @@ type VirtualClusterSpec struct {
 	// security trade-off is acceptable.
 	// +optional
 	VNode bool `json:"vnode,omitempty"`
+
+	// Nodes is the number of virtual worker nodes (vnode agent pods) to
+	// run. Only meaningful when VNode is true — in non-vnode mode there
+	// is no real kubelet to scale. Each extra node is a privileged pod
+	// costing ~200m CPU / 512Mi–2Gi memory, so scale deliberately.
+	// +optional
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	Nodes int32 `json:"nodes,omitempty"`
 }
 
 // VirtualClusterResources caps how much of the host's CPU, memory, storage,
