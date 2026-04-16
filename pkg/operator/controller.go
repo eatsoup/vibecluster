@@ -82,8 +82,8 @@ func (r *VirtualClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	logger.Info("Reconciling virtual cluster", "name", vc.Name, "namespace", opts.Namespace)
 
-	// 1. Ensure namespace
-	if err := r.ensureNamespace(ctx, opts); err != nil {
+	// 1. Ensure namespace (may allocate vnode CIDRs and store them on opts)
+	if err := r.ensureNamespace(ctx, &opts); err != nil {
 		return r.updateStatus(ctx, &vc, vibeclusterv1alpha1.VirtualClusterPhaseFailed, false, fmt.Sprintf("Failed to create namespace: %v", err), opts.Namespace)
 	}
 
@@ -118,6 +118,11 @@ func (r *VirtualClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// 6. Ensure Ingress (if expose.type == Ingress)
 	if err := r.ensureIngress(ctx, opts); err != nil {
 		return r.updateStatus(ctx, &vc, vibeclusterv1alpha1.VirtualClusterPhaseFailed, false, fmt.Sprintf("Failed to create Ingress: %v", err), opts.Namespace)
+	}
+
+	// 6a. Ensure vnode agent Deployment (if vnode mode)
+	if err := r.ensureVNodeDeployment(ctx, &opts); err != nil {
+		return r.updateStatus(ctx, &vc, vibeclusterv1alpha1.VirtualClusterPhaseFailed, false, fmt.Sprintf("Failed to create vnode Deployment: %v", err), opts.Namespace)
 	}
 
 	// 7. Check StatefulSet readiness
@@ -160,6 +165,7 @@ func (r *VirtualClusterReconciler) buildOptions(vc *vibeclusterv1alpha1.VirtualC
 			Pods:    vc.Spec.Resources.Pods,
 		}
 	}
+	opts.VNode = vc.Spec.VNode
 
 	return opts
 }
@@ -216,18 +222,70 @@ func (r *VirtualClusterReconciler) reconcileDelete(ctx context.Context, vc *vibe
 	return ctrl.Result{}, nil
 }
 
-// ensureNamespace creates the namespace if it doesn't exist.
-func (r *VirtualClusterReconciler) ensureNamespace(ctx context.Context, opts k8s.BuilderOptions) error {
-	ns := k8s.BuildNamespace(opts, map[string]string{
+// ensureNamespace creates the namespace if it doesn't exist. When vnode mode
+// is enabled, it allocates pod/service CIDRs and records them as namespace
+// annotations so the CIDR allocator can avoid collisions.
+func (r *VirtualClusterReconciler) ensureNamespace(ctx context.Context, opts *k8s.BuilderOptions) error {
+	annotations := map[string]string{
 		k8s.AnnotationCreated: time.Now().UTC().Format(time.RFC3339),
-	})
+	}
 
 	existing := &corev1.Namespace{}
-	err := r.Get(ctx, types.NamespacedName{Name: ns.Name}, existing)
+	err := r.Get(ctx, types.NamespacedName{Name: opts.Namespace}, existing)
 	if errors.IsNotFound(err) {
+		// Allocate CIDRs before creating the namespace so the annotations
+		// are present from the start.
+		if opts.VNode {
+			cidrs, allocErr := r.allocateVNodeCIDRs(ctx, opts)
+			if allocErr != nil {
+				return allocErr
+			}
+			annotations[k8s.AnnotationPodCIDR] = cidrs.Pod
+			annotations[k8s.AnnotationServiceCIDR] = cidrs.Service
+		}
+		ns := k8s.BuildNamespace(*opts, annotations)
 		return r.Create(ctx, ns)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Namespace already exists — pick up existing CIDR annotations or allocate.
+	if opts.VNode {
+		podCIDR := existing.Annotations[k8s.AnnotationPodCIDR]
+		svcCIDR := existing.Annotations[k8s.AnnotationServiceCIDR]
+		if podCIDR != "" && svcCIDR != "" {
+			opts.VNodeCIDRs = k8s.VNodeCIDRsFromAnnotations(podCIDR, svcCIDR)
+		} else {
+			cidrs, allocErr := r.allocateVNodeCIDRs(ctx, opts)
+			if allocErr != nil {
+				return allocErr
+			}
+			if existing.Annotations == nil {
+				existing.Annotations = map[string]string{}
+			}
+			existing.Annotations[k8s.AnnotationPodCIDR] = cidrs.Pod
+			existing.Annotations[k8s.AnnotationServiceCIDR] = cidrs.Service
+			if err := r.Update(ctx, existing); err != nil {
+				return fmt.Errorf("annotating namespace with CIDRs: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// allocateVNodeCIDRs picks a free CIDR pair and stores it on opts.
+func (r *VirtualClusterReconciler) allocateVNodeCIDRs(ctx context.Context, opts *k8s.BuilderOptions) (k8s.VNodeCIDRs, error) {
+	nss := &corev1.NamespaceList{}
+	if err := r.List(ctx, nss, client.MatchingLabels{k8s.LabelManagedBy: k8s.LabelManagedByValue}); err != nil {
+		return k8s.VNodeCIDRs{}, fmt.Errorf("listing vibecluster namespaces: %w", err)
+	}
+	cidrs, err := k8s.PickFreeVNodeCIDRs(nss.Items)
+	if err != nil {
+		return k8s.VNodeCIDRs{}, err
+	}
+	opts.VNodeCIDRs = cidrs
+	return cidrs, nil
 }
 
 // ensureResourceLimits creates or updates the per-vcluster ResourceQuota and
@@ -434,6 +492,54 @@ func (r *VirtualClusterReconciler) ensureIngress(ctx context.Context, opts k8s.B
 	}
 	if err := r.Update(ctx, existing); err != nil {
 		return fmt.Errorf("updating ingress: %w", err)
+	}
+	return nil
+}
+
+// ensureVNodeDeployment creates or updates the vnode agent Deployment when
+// vnode mode is enabled. When vnode is disabled, any pre-existing vnode
+// Deployment is removed.
+func (r *VirtualClusterReconciler) ensureVNodeDeployment(ctx context.Context, opts *k8s.BuilderOptions) error {
+	depName := opts.Name + "-vnode"
+
+	if !opts.VNode {
+		// Clean up if a previous reconcile created one.
+		existing := &appsv1.Deployment{}
+		err := r.Get(ctx, types.NamespacedName{Name: depName, Namespace: opts.Namespace}, existing)
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := r.Delete(ctx, existing); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("deleting stale vnode deployment: %w", err)
+		}
+		return nil
+	}
+
+	desired := k8s.BuildVNodeDeployment(*opts)
+	existing := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Name: depName, Namespace: opts.Namespace}, existing)
+	if errors.IsNotFound(err) {
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Reconcile the agent image.
+	needsUpdate := false
+	for i, c := range existing.Spec.Template.Spec.Containers {
+		for _, dc := range desired.Spec.Template.Spec.Containers {
+			if c.Name == dc.Name && c.Image != dc.Image {
+				existing.Spec.Template.Spec.Containers[i].Image = dc.Image
+				needsUpdate = true
+			}
+		}
+	}
+	if needsUpdate {
+		return r.Update(ctx, existing)
 	}
 	return nil
 }

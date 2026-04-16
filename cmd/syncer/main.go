@@ -10,6 +10,8 @@ import (
 
 	"github.com/eatsoup/vibecluster/pkg/k8s"
 	"github.com/eatsoup/vibecluster/pkg/syncer"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -32,6 +34,24 @@ func main() {
 		fmt.Println("Shutting down syncer...")
 		cancel()
 	}()
+
+	// In vnode mode there is a real in-vcluster
+	// kubelet, so the flat workload syncer and the kubelet shim are both
+	// unnecessary. Before idling, seed the coredns NodeHosts key so the
+	// in-vcluster coredns can start: k3s with --disable-agent does not
+	// create that key on its own, and coredns stays in ContainerCreating
+	// with "configmap references non-existent config key: NodeHosts".
+	// Once the key exists, k3s's own NodeHosts controller updates it as
+	// nodes register.
+	if os.Getenv(k8s.EnvVNodeMode) == "true" {
+		fmt.Println("VIBE_VNODE_MODE=true: workload sync and kubelet shim disabled.")
+		if err := bootstrapVNode(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "vnode bootstrap: %v\n", err)
+		}
+		fmt.Println("vnode bootstrap complete; idling.")
+		<-ctx.Done()
+		return
+	}
 
 	// Wait for k3s to be ready (kubeconfig file to appear)
 	vcKubeconfig := "/data/k3s/server/cred/admin.kubeconfig"
@@ -115,6 +135,55 @@ func waitForFile(ctx context.Context, path string, timeout time.Duration) error 
 		}
 	}
 	return fmt.Errorf("timeout waiting for %s", path)
+}
+
+// bootstrapVNode is the vnode-mode one-shot bootstrap: connect to the
+// in-vcluster k3s API as the cluster admin (via the kubeconfig k3s writes
+// to the shared data volume) and make sure the coredns ConfigMap has a
+// NodeHosts key. Errors are logged and swallowed — the vcluster stays
+// usable without coredns, and retrying on pod restart is fine.
+func bootstrapVNode(ctx context.Context) error {
+	vcKubeconfig := "/data/k3s/server/cred/admin.kubeconfig"
+	if err := waitForFile(ctx, vcKubeconfig, 5*time.Minute); err != nil {
+		return fmt.Errorf("waiting for kubeconfig: %w", err)
+	}
+	cfg, err := clientcmd.BuildConfigFromFlags("", vcKubeconfig)
+	if err != nil {
+		return fmt.Errorf("loading kubeconfig: %w", err)
+	}
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("building client: %w", err)
+	}
+	return seedCoreDNSNodeHosts(ctx, client)
+}
+
+// seedCoreDNSNodeHosts polls for the kube-system/coredns ConfigMap and adds
+// an empty NodeHosts key if missing. k3s's NodeHosts controller takes over
+// from there and fills in real entries as nodes register.
+func seedCoreDNSNodeHosts(ctx context.Context, client kubernetes.Interface) error {
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		cm, err := client.CoreV1().ConfigMaps("kube-system").Get(ctx, "coredns", metav1.GetOptions{})
+		if err == nil {
+			if _, ok := cm.Data["NodeHosts"]; ok {
+				return nil
+			}
+			patch := []byte(`{"data":{"NodeHosts":""}}`)
+			_, err = client.CoreV1().ConfigMaps("kube-system").Patch(ctx, "coredns", types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+			if err != nil {
+				return fmt.Errorf("patching coredns configmap: %w", err)
+			}
+			fmt.Println("coredns NodeHosts seeded.")
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return fmt.Errorf("timeout waiting for kube-system/coredns configmap")
 }
 
 func waitForAPI(ctx context.Context, client *kubernetes.Clientset, timeout time.Duration) error {

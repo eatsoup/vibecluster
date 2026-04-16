@@ -1,6 +1,8 @@
 package k8s
 
 import (
+	"fmt"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -41,6 +43,15 @@ type BuilderOptions struct {
 	// quota is installed and the cluster can use whatever the host scheduler
 	// gives it. The k3s control plane's own usage counts against the budget.
 	Resources *ResourceLimits
+	// VNode enables the nested data-plane mode: the k3s server is configured
+	// with flannel + network-policy + servicelb + coredns, the flat workload
+	// syncer is disabled, and a privileged Deployment runs k3s agent joined
+	// to the virtual server so real workloads run inside an in-vcluster
+	// kubelet.
+	VNode bool
+	// VNodeCIDRs holds the allocated pod/service CIDR pair for vnode mode.
+	// Only meaningful when VNode is true.
+	VNodeCIDRs VNodeCIDRs
 }
 
 // ResourceLimits is the per-vcluster resource budget enforced via a
@@ -388,8 +399,44 @@ func BuildHeadlessService(opts BuilderOptions) *corev1.Service {
 
 // k3sArgs returns the command-line args for the k3s server container.
 // It is exported via BuildStatefulSet — kept separate so the expose host
-// can be appended to the TLS-SAN list when set.
+// can be appended to the TLS-SAN list when set. In vnode mode the
+// networking defaults are left on (flannel, network-policy, servicelb,
+// coredns) because a real agent Deployment joins the cluster and runs
+// those components — see BuildVNodeDeployment.
 func k3sArgs(opts BuilderOptions) []string {
+	tlsSAN := []string{
+		"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc.cluster.local",
+		"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc",
+		"--tls-san=" + opts.Name,
+	}
+	if opts.ExposeHost != "" {
+		tlsSAN = append(tlsSAN, "--tls-san="+opts.ExposeHost)
+	}
+
+	if opts.VNode {
+		// Keep --disable-agent: the server pod itself is not a node. The
+		// vnode Deployment is. Leave flannel + network-policy + servicelb
+		// + coredns ON so NetworkPolicy and LoadBalancer Services work
+		// inside the virtual cluster without any syncer translation.
+		//
+		// Pod/service CIDRs come from AllocateVNodeCIDRs so multiple
+		// vclusters on one host don't collide with each other or with the
+		// host k3s defaults (10.42/16 and 10.43/16).
+		args := []string{
+			"server",
+			"--disable=traefik,metrics-server,local-storage",
+			"--disable-agent",
+			"--disable-cloud-controller",
+			"--disable-helm-controller",
+			"--token=" + VNodeAgentToken(opts.Name),
+			"--data-dir=/data/k3s",
+			"--cluster-cidr=" + opts.VNodeCIDRs.Pod,
+			"--service-cidr=" + opts.VNodeCIDRs.Service,
+			"--cluster-dns=" + opts.VNodeCIDRs.ClusterDNS,
+		}
+		return append(args, tlsSAN...)
+	}
+
 	args := []string{
 		"server",
 		// coredns is disabled because the virtual cluster has no kubelet
@@ -417,14 +464,8 @@ func k3sArgs(opts BuilderOptions) []string {
 		// host kubelet — which doesn't know virtual pod names. See issue #21.
 		"--kube-apiserver-arg=kubelet-preferred-address-types=InternalIP",
 		"--data-dir=/data/k3s",
-		"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc.cluster.local",
-		"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc",
-		"--tls-san=" + opts.Name,
 	}
-	if opts.ExposeHost != "" {
-		args = append(args, "--tls-san="+opts.ExposeHost)
-	}
-	return args
+	return append(args, tlsSAN...)
 }
 
 // BuildStatefulSet returns the StatefulSet for the virtual cluster (k3s + syncer).
@@ -519,25 +560,7 @@ func BuildStatefulSet(opts BuilderOptions) *appsv1.StatefulSet {
 						{
 							Name:  "syncer",
 							Image: syncerImage,
-							Env: []corev1.EnvVar{
-								{
-									Name:  "VCLUSTER_NAME",
-									Value: opts.Name,
-								},
-								{
-									// POD_IP is needed by the kubelet shim:
-									// it's the bind address, the SAN baked
-									// into its TLS cert, and the value the
-									// syncer patches into every synced
-									// virtual node's InternalIP.
-									Name: "POD_IP",
-									ValueFrom: &corev1.EnvVarSource{
-										FieldRef: &corev1.ObjectFieldSelector{
-											FieldPath: "status.podIP",
-										},
-									},
-								},
-							},
+							Env:   syncerEnv(opts),
 							Ports: []corev1.ContainerPort{
 								{
 									// Kubelet shim. The virtual k3s API
@@ -596,4 +619,148 @@ func BuildStatefulSet(opts BuilderOptions) *appsv1.StatefulSet {
 	}
 
 	return sts
+}
+
+// syncerEnv returns the env block for the syncer sidecar. In vnode mode
+// the VIBE_VNODE_MODE env is set so the syncer skips workload sync loops.
+func syncerEnv(opts BuilderOptions) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{Name: "VCLUSTER_NAME", Value: opts.Name},
+		{
+			// POD_IP is needed by the kubelet shim: it's the bind address,
+			// the SAN baked into its TLS cert, and the value the syncer
+			// patches into every synced virtual node's InternalIP.
+			Name: "POD_IP",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "status.podIP",
+				},
+			},
+		},
+	}
+	if opts.VNode {
+		env = append(env, corev1.EnvVar{Name: EnvVNodeMode, Value: "true"})
+	}
+	return env
+}
+
+// BuildVNodeDeployment returns the privileged k3s-agent Deployment that
+// forms the single virtual node for a vnode-mode cluster. The agent joins
+// the virtual k3s server via the in-cluster Service DNS name, using the
+// deterministic per-vcluster token.
+//
+// This pod needs privileged: true on a stock host cluster: the embedded
+// kubelet mounts cgroups, the CNI (flannel) manipulates iptables/netlink,
+// and containerd-in-containerd needs /dev access.
+func BuildVNodeDeployment(opts BuilderOptions) *appsv1.Deployment {
+	depName := opts.Name + "-vnode"
+	// Intentionally do NOT copy the base labels — the main Service and the
+	// headless Service select on `app: vibecluster`, so carrying that label
+	// here would make the API server Service load-balance between the k3s
+	// server pod and the vnode pod (which doesn't listen on 6443).
+	depLabels := map[string]string{
+		LabelManagedBy:              LabelManagedByValue,
+		LabelVClusterName:           opts.Name,
+		"vibecluster.dev/component": "vnode",
+	}
+
+	serverURL := fmt.Sprintf("https://%s.%s.svc.cluster.local:%d", opts.Name, opts.Namespace, ServicePort)
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      depName,
+			Namespace: opts.Namespace,
+			Labels:    depLabels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](1),
+			Selector: &metav1.LabelSelector{MatchLabels: depLabels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: depLabels},
+				Spec: corev1.PodSpec{
+					ServiceAccountName:            "vc-" + opts.Name,
+					TerminationGracePeriodSeconds: ptr.To[int64](10),
+					// Nested containerd exhausts the host's default
+					// fs.inotify.max_user_instances (128 on most distros).
+					// Bump it via a privileged init container.
+					InitContainers: []corev1.Container{
+						{
+							Name:  "sysctl",
+							Image: VNodeAgentImage,
+							Command: []string{"sh", "-c",
+								"sysctl -w fs.inotify.max_user_instances=8192 && sysctl -w fs.inotify.max_user_watches=1048576",
+							},
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: ptr.To(true),
+								RunAsUser:  ptr.To[int64](0),
+							},
+						},
+					},
+					Containers: []corev1.Container{
+						{
+							Name:    "k3s-agent",
+							Image:   VNodeAgentImage,
+							Command: []string{"k3s"},
+							Args: []string{
+								"agent",
+								"--server=" + serverURL,
+								"--token=" + VNodeAgentToken(opts.Name),
+								"--node-name=$(NODE_NAME)",
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name: "NODE_NAME",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											FieldPath: "metadata.name",
+										},
+									},
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: ptr.To(true),
+								RunAsUser:  ptr.To[int64](0),
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+									corev1.ResourceMemory: resource.MustParse("512Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("2Gi"),
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "k3s-data", MountPath: "/var/lib/rancher/k3s"},
+								{Name: "kubelet", MountPath: "/var/lib/kubelet"},
+								{Name: "cni-bin", MountPath: "/opt/cni/bin"},
+								{Name: "cni-conf", MountPath: "/etc/cni/net.d"},
+								{Name: "modules", MountPath: "/lib/modules", ReadOnly: true},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{Name: "k3s-data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{Name: "kubelet", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{Name: "cni-bin", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{Name: "cni-conf", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{
+							Name: "modules",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{Path: "/lib/modules"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if opts.ImagePullSecret != "" {
+		dep.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
+			{Name: opts.ImagePullSecret},
+		}
+	}
+
+	return dep
 }

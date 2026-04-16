@@ -28,6 +28,7 @@ type createOptions struct {
 	memory             string
 	storage            string
 	pods               int32
+	vnode              bool
 }
 
 func newCreateCommand() *cobra.Command {
@@ -58,6 +59,7 @@ func newCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.memory, "memory", "", "memory budget for the virtual cluster (e.g. 8Gi); enforced via a namespace ResourceQuota. Includes the k3s control plane.")
 	cmd.Flags().StringVar(&opts.storage, "storage", "", "total persistent storage budget across all PVCs (e.g. 50Gi); enforced via a namespace ResourceQuota.")
 	cmd.Flags().Int32Var(&opts.pods, "pods", 0, "maximum pod count in the virtual cluster (0 = unlimited).")
+	cmd.Flags().BoolVar(&opts.vnode, "vnode", false, "run a nested k3s agent pod so NetworkPolicy and LoadBalancer work inside the virtual cluster. Requires privileged pods on the host.")
 
 	return cmd
 }
@@ -96,6 +98,7 @@ func runCreate(name string, opts *createOptions) error {
 		}
 		spec := k8s.VirtualClusterCRSpec{
 			SyncerImage: opts.syncerImage,
+			VNode:       opts.vnode,
 		}
 		if opts.exposeType != "" {
 			spec.Expose = &k8s.VirtualClusterCRExpose{
@@ -123,6 +126,7 @@ func runCreate(name string, opts *createOptions) error {
 		ExposeIngressClass: opts.exposeIngressClass,
 		ExposeHost:         opts.exposeHost,
 		Resources:          resourceLimitsFromOpts(opts),
+		VNode:              opts.vnode,
 	}
 
 	fmt.Printf("Creating virtual cluster %q...\n", name)

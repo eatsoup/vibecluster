@@ -81,6 +81,10 @@ spec:
                     ingressClass:
                       description: IngressClass is the IngressClassName to use when type is Ingress.
                       type: string
+                vnode:
+                  description: VNode enables nested data-plane mode. A privileged k3s-agent pod joins the virtual API server and runs real flannel, kube-router, and klipper-lb so NetworkPolicy and in-vcluster LoadBalancer Services are enforced by real controllers. Requires privileged pods on the host.
+                  type: boolean
+                  default: false
                 resources:
                   description: Resources caps the total resources the virtual cluster can consume on the host. The k3s control plane's own usage counts against these caps.
                   type: object
