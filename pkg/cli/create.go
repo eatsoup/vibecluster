@@ -59,7 +59,7 @@ func newCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.memory, "memory", "", "memory budget for the virtual cluster (e.g. 8Gi); enforced via a namespace ResourceQuota. Includes the k3s control plane.")
 	cmd.Flags().StringVar(&opts.storage, "storage", "", "total persistent storage budget across all PVCs (e.g. 50Gi); enforced via a namespace ResourceQuota.")
 	cmd.Flags().Int32Var(&opts.pods, "pods", 0, "maximum pod count in the virtual cluster (0 = unlimited).")
-	cmd.Flags().BoolVar(&opts.vnode, "vnode", false, "prototype: run a nested k3s agent pod so NetworkPolicy and LoadBalancer work inside the virtual cluster. Requires privileged pods on the host. See issue #27.")
+	cmd.Flags().BoolVar(&opts.vnode, "vnode", false, "run a nested k3s agent pod so NetworkPolicy and LoadBalancer work inside the virtual cluster. Requires privileged pods on the host.")
 
 	return cmd
 }
@@ -91,13 +91,6 @@ func runCreate(name string, opts *createOptions) error {
 		return err
 	}
 
-	if opts.vnode && useOperator {
-		// The CRD does not model the vnode prototype field yet (issue #27).
-		// Forcing legacy keeps the flag usable without a CRD version bump
-		// while the prototype is still on a branch.
-		return fmt.Errorf("--vnode is not yet supported in operator mode; re-run with --mode=legacy")
-	}
-
 	if useOperator {
 		fmt.Printf("Operator detected. Creating VirtualCluster CR %q in namespace %q...\n", name, opts.crNamespace)
 		if opts.imagePullSecret != "" {
@@ -105,6 +98,7 @@ func runCreate(name string, opts *createOptions) error {
 		}
 		spec := k8s.VirtualClusterCRSpec{
 			SyncerImage: opts.syncerImage,
+			VNode:       opts.vnode,
 		}
 		if opts.exposeType != "" {
 			spec.Expose = &k8s.VirtualClusterCRExpose{

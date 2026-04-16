@@ -20,9 +20,8 @@ type VNodeCIDRs struct {
 
 // vnode CIDR pool. Each /16 is chosen to avoid the k3s host defaults
 // (10.42/16 for pods, 10.43/16 for services) and the typical service CIDRs
-// shipped by EKS/GKE. Ten slots per family is a deliberate prototype ceiling
-// — productization would switch to smaller per-vcluster ranges (e.g. /20) to
-// fit more clusters on one host.
+// shipped by EKS/GKE. Ten slots per family supports up to ten concurrent
+// vnode clusters on one host.
 const (
 	vnodePodCIDRStart = 244
 	vnodePodCIDREnd   = 253
@@ -64,6 +63,22 @@ func collectUsedVNodeCIDRs(nss []corev1.Namespace) usedVNodeCIDRs {
 		}
 	}
 	return u
+}
+
+// VNodeCIDRsFromAnnotations reconstructs VNodeCIDRs from namespace annotations.
+func VNodeCIDRsFromAnnotations(podCIDR, svcCIDR string) VNodeCIDRs {
+	// Derive cluster DNS from the service CIDR: 10.X.0.10
+	dns := ""
+	var x int
+	if _, err := fmt.Sscanf(svcCIDR, "10.%d.0.0/16", &x); err == nil {
+		dns = fmt.Sprintf("10.%d.0.10", x)
+	}
+	return VNodeCIDRs{Pod: podCIDR, Service: svcCIDR, ClusterDNS: dns}
+}
+
+// PickFreeVNodeCIDRs picks a free CIDR pair given existing namespaces.
+func PickFreeVNodeCIDRs(nss []corev1.Namespace) (VNodeCIDRs, error) {
+	return pickFreeVNodeCIDRs(collectUsedVNodeCIDRs(nss))
 }
 
 func pickFreeVNodeCIDRs(used usedVNodeCIDRs) (VNodeCIDRs, error) {

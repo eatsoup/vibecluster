@@ -57,6 +57,8 @@ type VirtualClusterCRSpec struct {
 	// Resources caps host resources the virtual cluster can consume. nil
 	// means no quota.
 	Resources *ResourceLimits
+	// VNode enables nested data-plane mode.
+	VNode bool
 }
 
 // VirtualClusterCRExpose mirrors api/v1alpha1.VirtualClusterExpose for the CLI.
@@ -120,6 +122,9 @@ func createVirtualClusterCRWith(ctx context.Context, dynClient dynamic.Interface
 			resMap["pods"] = int64(spec.Resources.Pods)
 		}
 		specMap["resources"] = resMap
+	}
+	if spec.VNode {
+		specMap["vnode"] = true
 	}
 
 	obj := &unstructured.Unstructured{

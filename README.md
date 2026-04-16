@@ -181,10 +181,36 @@ Synced resources on the host are labeled with:
 | `--memory` | _(unset)_ | Total memory budget for the virtual cluster (e.g. `8Gi`). Enforced via a namespace `ResourceQuota`. The k3s control plane counts against this. |
 | `--storage` | _(unset)_ | Total persistent storage budget across all PVCs (e.g. `50Gi`). Enforced via a namespace `ResourceQuota`. |
 | `--pods` | `0` | Maximum pod count in the virtual cluster (`0` = unlimited). |
+| `--vnode` | `false` | Enable nested data-plane mode (real NetworkPolicy + LoadBalancer). Requires privileged pods on the host. |
 
 When any of `--cpu`, `--memory`, `--storage`, or `--pods` is set, vibecluster also installs a `LimitRange` in the `vc-<name>` namespace that supplies default container CPU/memory requests and limits — without it, workloads created without explicit resource requests would be rejected by the matching ResourceQuota at admission time.
 
-When `vibecluster create` runs in operator mode, the CLI submits a `VirtualCluster` CR for the operator to reconcile rather than creating manifests directly. The `--expose`, `--expose-host`, and `--expose-ingress-class` flags are translated into the CR's `spec.expose` field, so the operator stands up the LoadBalancer or Ingress as part of reconciliation. `--image-pull-secret` is the only legacy-only flag — the CRD does not yet model it, so it's ignored in operator mode (a notice is printed).
+When `vibecluster create` runs in operator mode, the CLI submits a `VirtualCluster` CR for the operator to reconcile rather than creating manifests directly. The `--expose`, `--expose-host`, `--expose-ingress-class`, and `--vnode` flags are translated into the CR's spec fields, so the operator stands up the corresponding resources as part of reconciliation. `--image-pull-secret` is the only legacy-only flag — the CRD does not yet model it, so it's ignored in operator mode (a notice is printed).
+
+### VNode mode (nested data plane)
+
+By default, virtual clusters use a flat syncer that translates workloads to the host namespace. This approach is lightweight but cannot enforce `NetworkPolicy` or run in-vcluster `LoadBalancer` Services, because there is no real CNI or kube-router inside the virtual cluster.
+
+**VNode mode** solves this by running a privileged k3s agent pod that joins the virtual API server as a real node. The agent brings flannel, kube-router, and klipper-lb, so `NetworkPolicy` rules and `LoadBalancer` Services work the same way they do on a standalone cluster.
+
+```bash
+# CLI
+vibecluster create mycluster --vnode
+
+# Operator CR
+kubectl apply -f - <<EOF
+apiVersion: vibecluster.dev/v1alpha1
+kind: VirtualCluster
+metadata:
+  name: mycluster
+spec:
+  vnode: true
+EOF
+```
+
+**Requirements:** The vnode agent pod needs `privileged: true` on the host cluster. Only enable vnode mode where that security trade-off is acceptable.
+
+Each vnode cluster is allocated a unique pod and service CIDR (`/16` ranges) so multiple vnode clusters on the same host do not collide.
 
 ### Connect flags
 
@@ -270,6 +296,7 @@ dev-cluster   Running   true    vc-dev-cluster    5m
 | `resources.memory` | _(unset)_ | Total memory budget (e.g. `8Gi`). Enforced via a namespace `ResourceQuota`. Includes the k3s control plane. |
 | `resources.storage` | _(unset)_ | Total persistent storage budget across all PVCs (e.g. `50Gi`). Enforced via a namespace `ResourceQuota`. |
 | `resources.pods` | _(unset)_ | Maximum pod count. |
+| `vnode` | `false` | Enable nested data-plane mode (real NetworkPolicy + LoadBalancer). Requires privileged pods on the host. |
 
 Example with persistent Ingress exposure:
 

@@ -35,6 +35,16 @@ type VirtualClusterSpec struct {
 	// these caps; size accordingly.
 	// +optional
 	Resources *VirtualClusterResources `json:"resources,omitempty"`
+
+	// VNode enables nested data-plane mode: a privileged k3s-agent pod
+	// joins the virtual API server and runs real flannel + kube-router +
+	// klipper-lb, so NetworkPolicy and in-vcluster LoadBalancer Services
+	// are enforced by real controllers instead of approximated by
+	// host-side translation. Because the nested agent needs
+	// privileged=true on stock host clusters, only enable this where that
+	// security trade-off is acceptable.
+	// +optional
+	VNode bool `json:"vnode,omitempty"`
 }
 
 // VirtualClusterResources caps how much of the host's CPU, memory, storage,

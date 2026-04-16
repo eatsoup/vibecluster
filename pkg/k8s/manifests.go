@@ -29,11 +29,11 @@ type CreateOptions struct {
 	// vc-<name> namespace. The k3s control plane's own usage counts against
 	// the budget; size accordingly. nil means no quota.
 	Resources *ResourceLimits
-	// VNode switches the cluster to the nested data-plane prototype: the
-	// k3s server is configured with flannel + network-policy + servicelb,
-	// the flat workload syncer is disabled, and a privileged Deployment
-	// runs k3s agent joined to the virtual server so real workloads run
-	// inside an in-vcluster kubelet. See issue #27.
+	// VNode enables nested data-plane mode: the k3s server is configured
+	// with flannel + network-policy + servicelb, the flat workload syncer
+	// is disabled, and a privileged Deployment runs k3s agent joined to
+	// the virtual server so real workloads run inside an in-vcluster
+	// kubelet.
 	VNode bool
 }
 
@@ -116,7 +116,7 @@ func CreateVirtualCluster(ctx context.Context, client kubernetes.Interface, name
 	}
 
 	// 8. In vnode mode, create the privileged k3s-agent Deployment that
-	//    acts as the single virtual node for this prototype (issue #27).
+	//    acts as the single virtual node.
 	if opts.VNode {
 		fmt.Printf("  Creating vnode agent Deployment...\n")
 		if err := createVNodeDeployment(ctx, client, name, ns, labels, opts.ImagePullSecret); err != nil {
@@ -552,8 +552,7 @@ func createStatefulSet(ctx context.Context, client kubernetes.Interface, name, n
 // buildK3sServerArgs returns the arg list for the k3s server container. The
 // vnode variant flips the networking defaults back on (flannel, network
 // policy, servicelb, coredns) because a real agent Deployment is joining the
-// cluster and will run those components — see createVNodeDeployment and
-// issue #27.
+// cluster and will run those components — see createVNodeDeployment.
 func buildK3sServerArgs(name, ns, exposeHost string, vnode bool, vnodeCIDRs VNodeCIDRs) []string {
 	tlsSAN := []string{
 		"--tls-san=" + name + "." + ns + ".svc.cluster.local",
@@ -642,27 +641,23 @@ func buildSyncerEnv(name string, vnode bool) []corev1.EnvVar {
 	return env
 }
 
-// VNodeAgentToken returns the deterministic k3s join token used for the
-// prototype. One per-vcluster value, derived from the name, so the agent
-// pod and server pod agree without any shared-secret bootstrap dance.
-// Productization should replace this with a generated secret.
+// VNodeAgentToken returns the deterministic k3s join token. One per-vcluster
+// value, derived from the name, so the agent pod and server pod agree without
+// any shared-secret bootstrap dance.
 func VNodeAgentToken(name string) string {
 	return "vibecluster-vnode-" + name
 }
 
 // createVNodeDeployment stands up the privileged k3s-agent Deployment that
-// forms the single virtual node for a vnode-mode cluster (issue #27).
+// forms the single virtual node for a vnode-mode cluster.
 //
 // The agent joins the virtual k3s server via the in-cluster Service DNS
 // name (which is in the server cert's SAN list), using the deterministic
-// per-vcluster token. One replica for the prototype; multi-node is
-// productization scope.
+// per-vcluster token.
 //
 // This pod needs privileged: true on a stock host cluster: the embedded
 // kubelet mounts cgroups, the CNI (flannel) manipulates iptables/netlink,
-// and containerd-in-containerd needs /dev access. Running non-privileged
-// is feasible with Sysbox on the host — see the rootless investigation
-// on issue #27 for why we are explicitly not doing that here.
+// and containerd-in-containerd needs /dev access.
 func createVNodeDeployment(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, imagePullSecret string) error {
 	depName := name + "-vnode"
 	// Intentionally do NOT copy the base labels — the main Service and the

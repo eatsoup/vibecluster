@@ -35,7 +35,7 @@ func main() {
 		cancel()
 	}()
 
-	// In vnode mode (prototype, issue #27) there is a real in-vcluster
+	// In vnode mode there is a real in-vcluster
 	// kubelet, so the flat workload syncer and the kubelet shim are both
 	// unnecessary. Before idling, seed the coredns NodeHosts key so the
 	// in-vcluster coredns can start: k3s with --disable-agent does not
