@@ -18,6 +18,7 @@ import (
 // host resources: namespace, StatefulSet, Service, ServiceAccount, and
 // ClusterRoleBinding.
 func TestCreateLegacy(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("lc")
 	ns := "vc-" + name
 	defer helpers.DumpDebug(t, ns)
@@ -34,12 +35,13 @@ func TestCreateLegacy(t *testing.T) {
 	// Service must exist.
 	helpers.MustKubectl(t, helpers.HostKubeconfig, "get", "svc", name, "-n", ns)
 
-	// ServiceAccount must exist.
-	helpers.MustKubectl(t, helpers.HostKubeconfig, "get", "serviceaccount", name, "-n", ns)
+	// ServiceAccount must exist. vibecluster names it after the namespace (vc-<name>).
+	helpers.MustKubectl(t, helpers.HostKubeconfig, "get", "serviceaccount", ns, "-n", ns)
 }
 
 // TestListShowsCluster verifies that `vibecluster list` surfaces a created cluster.
 func TestListShowsCluster(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("ls")
 	defer helpers.DumpDebug(t, "vc-"+name)
 
@@ -61,6 +63,7 @@ func TestListShowsCluster(t *testing.T) {
 // TestConnectPrint verifies that `vibecluster connect --print` emits a valid
 // kubeconfig YAML (contains the expected context name).
 func TestConnectPrint(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("cp")
 	defer helpers.DumpDebug(t, "vc-"+name)
 
@@ -83,6 +86,7 @@ func TestConnectPrint(t *testing.T) {
 // TestLogsCommands verifies that both the syncer and k3s log streams are
 // non-empty, confirming both containers are running and producing output.
 func TestLogsCommands(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("log")
 	defer helpers.DumpDebug(t, "vc-"+name)
 
@@ -114,6 +118,7 @@ func TestLogsCommands(t *testing.T) {
 
 // TestDelete verifies that after deletion the vc-* namespace no longer exists.
 func TestDelete(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("del")
 	helpers.MustVibeCluster(t, "create", name, "--mode=legacy", "--connect=false")
 
@@ -135,6 +140,7 @@ func TestDelete(t *testing.T) {
 // TestCreateSameNameTwice verifies that creating a cluster that already exists
 // returns a non-zero exit code.
 func TestCreateSameNameTwice(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("dup")
 	defer helpers.DumpDebug(t, "vc-"+name)
 
@@ -169,6 +175,7 @@ func TestDeleteNonExistent(t *testing.T) {
 // TestCreateDeleteRecreate verifies that creating, deleting, and recreating a
 // cluster with the same name works without leftover state causing failures.
 func TestCreateDeleteRecreate(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("cdr")
 	defer helpers.DumpDebug(t, "vc-"+name)
 

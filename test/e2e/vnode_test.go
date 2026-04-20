@@ -15,6 +15,7 @@ import (
 // privileged k3s-agent pod that registers as a real Node inside the virtual
 // cluster's API server.
 func TestVNodeCreation(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("vn")
 	ns := "vc-" + name
 	defer helpers.DumpDebug(t, ns)
@@ -62,6 +63,7 @@ func TestVNodeCreation(t *testing.T) {
 // TestVNodeMultiNode verifies that `--vnode --nodes N` starts N agent pods and
 // all register as Ready nodes in the virtual cluster.
 func TestVNodeMultiNode(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("vnm")
 	ns := "vc-" + name
 	defer helpers.DumpDebug(t, ns)
@@ -116,6 +118,7 @@ func TestVNodeMultiNode(t *testing.T) {
 // vnode virtual cluster is actually enforced (in flat-syncer mode, CNI is
 // absent so NetworkPolicy is silently ignored).
 func TestVNodeNetworkPolicy(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("vnp")
 	ns := "vc-" + name
 	defer helpers.DumpDebug(t, ns)

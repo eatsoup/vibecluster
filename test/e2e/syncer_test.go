@@ -11,48 +11,51 @@ import (
 	"github.com/eatsoup/vibecluster/test/e2e/helpers"
 )
 
-// TestPodNameTranslation verifies the syncer's naming convention:
-// a pod named <pod> in virtual namespace <ns> appears in the host as
-// <clustername>-x-<pod>-x-<ns> inside vc-<clustername>.
+// TestPodNameTranslation verifies that a pod in the shared vcluster appears in
+// the host namespace under the translated name <clustername>-x-<pod>-x-<ns>.
 func TestPodNameTranslation(t *testing.T) {
-	name := helpers.UniqueName("syn")
-	ns := "vc-" + name
+	t.Parallel()
+	ns := "vc-" + helpers.SharedVCName
 	defer helpers.DumpDebug(t, ns)
 
-	vcKubeconfig := helpers.CreateVCluster(t, name)
+	podName := helpers.UniqueName("myapp")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"run", podName, "--image=nginx:alpine", "--restart=Never")
+	t.Cleanup(func() {
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", podName, "--ignore-not-found") //nolint:errcheck
+	})
 
-	helpers.MustKubectl(t, vcKubeconfig,
-		"run", "myapp", "--image=nginx:alpine", "--restart=Never")
-
+	translated := helpers.SharedVCName + "-x-" + podName + "-x-default"
 	helpers.MustWaitFor(t, 5*time.Minute, 5*time.Second, func() error {
 		out, err := helpers.Kubectl(t, helpers.HostKubeconfig,
 			"get", "pods", "-n", ns, "-o", "jsonpath={.items[*].metadata.name}")
 		if err != nil {
 			return err
 		}
-		translated := name + "-x-myapp-x-default"
-		for _, podName := range strings.Fields(out) {
-			if podName == translated {
+		for _, n := range strings.Fields(out) {
+			if n == translated {
 				return nil
 			}
 		}
-		return fmt.Errorf("translated pod %q not found in host ns %s; got: %s", translated, ns, out)
+		return fmt.Errorf("translated pod %q not found; got: %s", translated, out)
 	})
 }
 
-// TestServiceSync verifies that a Service created in the virtual cluster is
-// mirrored into the host namespace with the translated name.
+// TestServiceSync verifies that a Service in the shared vcluster is mirrored
+// into the host namespace.
 func TestServiceSync(t *testing.T) {
-	name := helpers.UniqueName("svc")
-	ns := "vc-" + name
+	t.Parallel()
+	ns := "vc-" + helpers.SharedVCName
 	defer helpers.DumpDebug(t, ns)
 
-	vcKubeconfig := helpers.CreateVCluster(t, name)
+	svcName := helpers.UniqueName("mysvc")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"create", "service", "clusterip", svcName, "--tcp=80:80")
+	t.Cleanup(func() {
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "svc", svcName, "--ignore-not-found") //nolint:errcheck
+	})
 
-	helpers.MustKubectl(t, vcKubeconfig,
-		"create", "service", "clusterip", "my-svc", "--tcp=80:80")
-
-	translated := name + "-x-my-svc-x-default"
+	translated := helpers.SharedVCName + "-x-" + svcName + "-x-default"
 	helpers.MustWaitFor(t, 2*time.Minute, 5*time.Second, func() error {
 		_, err := helpers.Kubectl(t, helpers.HostKubeconfig,
 			"get", "svc", translated, "-n", ns)
@@ -60,19 +63,21 @@ func TestServiceSync(t *testing.T) {
 	})
 }
 
-// TestConfigMapSync verifies that a ConfigMap created in the virtual cluster
-// is mirrored into the host namespace with the translated name and correct data.
+// TestConfigMapSync verifies that a ConfigMap in the shared vcluster is
+// mirrored into the host namespace with the correct data.
 func TestConfigMapSync(t *testing.T) {
-	name := helpers.UniqueName("cms")
-	ns := "vc-" + name
+	t.Parallel()
+	ns := "vc-" + helpers.SharedVCName
 	defer helpers.DumpDebug(t, ns)
 
-	vcKubeconfig := helpers.CreateVCluster(t, name)
+	cmName := helpers.UniqueName("cm")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"create", "configmap", cmName, "--from-literal=key=value123")
+	t.Cleanup(func() {
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "configmap", cmName, "--ignore-not-found") //nolint:errcheck
+	})
 
-	helpers.MustKubectl(t, vcKubeconfig,
-		"create", "configmap", "test-cm", "--from-literal=key=value123")
-
-	translated := name + "-x-test-cm-x-default"
+	translated := helpers.SharedVCName + "-x-" + cmName + "-x-default"
 	helpers.MustWaitFor(t, 2*time.Minute, 5*time.Second, func() error {
 		out, err := helpers.Kubectl(t, helpers.HostKubeconfig,
 			"get", "configmap", translated, "-n", ns,
@@ -87,68 +92,60 @@ func TestConfigMapSync(t *testing.T) {
 	})
 }
 
-// TestDeletePropagation verifies that deleting a resource in the virtual
-// cluster causes the syncer to remove its host shadow.
+// TestDeletePropagation verifies that deleting a virtual resource removes its
+// host shadow.
 func TestDeletePropagation(t *testing.T) {
-	name := helpers.UniqueName("del")
-	ns := "vc-" + name
+	t.Parallel()
+	ns := "vc-" + helpers.SharedVCName
 	defer helpers.DumpDebug(t, ns)
 
-	vcKubeconfig := helpers.CreateVCluster(t, name)
+	cmName := helpers.UniqueName("eph")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"create", "configmap", cmName, "--from-literal=x=1")
 
-	// Create and wait for sync.
-	helpers.MustKubectl(t, vcKubeconfig,
-		"create", "configmap", "ephemeral-cm", "--from-literal=x=1")
-	translated := name + "-x-ephemeral-cm-x-default"
+	translated := helpers.SharedVCName + "-x-" + cmName + "-x-default"
 	helpers.MustWaitFor(t, 2*time.Minute, 5*time.Second, func() error {
-		_, err := helpers.Kubectl(t, helpers.HostKubeconfig,
-			"get", "configmap", translated, "-n", ns)
+		_, err := helpers.Kubectl(t, helpers.HostKubeconfig, "get", "configmap", translated, "-n", ns)
 		return err
 	})
 
-	// Delete the virtual resource.
-	helpers.MustKubectl(t, vcKubeconfig, "delete", "configmap", "ephemeral-cm")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig, "delete", "configmap", cmName)
 
-	// Host shadow must disappear.
 	helpers.MustWaitFor(t, 2*time.Minute, 5*time.Second, func() error {
-		_, err := helpers.Kubectl(t, helpers.HostKubeconfig,
-			"get", "configmap", translated, "-n", ns)
+		_, err := helpers.Kubectl(t, helpers.HostKubeconfig, "get", "configmap", translated, "-n", ns)
 		if err != nil {
-			return nil // gone — expected
+			return nil
 		}
 		return fmt.Errorf("host shadow %s still exists", translated)
 	})
 }
 
-// TestConfigMapUpdatePropagation verifies that updating a ConfigMap in the
-// virtual cluster propagates the change to the host shadow.
+// TestConfigMapUpdatePropagation verifies that updating a virtual ConfigMap
+// propagates to the host shadow.
 func TestConfigMapUpdatePropagation(t *testing.T) {
-	name := helpers.UniqueName("upd")
-	ns := "vc-" + name
+	t.Parallel()
+	ns := "vc-" + helpers.SharedVCName
 	defer helpers.DumpDebug(t, ns)
 
-	vcKubeconfig := helpers.CreateVCluster(t, name)
+	cmName := helpers.UniqueName("upd")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"create", "configmap", cmName, "--from-literal=rev=v1")
+	t.Cleanup(func() {
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "configmap", cmName, "--ignore-not-found") //nolint:errcheck
+	})
 
-	helpers.MustKubectl(t, vcKubeconfig,
-		"create", "configmap", "mutable-cm", "--from-literal=rev=v1")
-
-	translated := name + "-x-mutable-cm-x-default"
+	translated := helpers.SharedVCName + "-x-" + cmName + "-x-default"
 	helpers.MustWaitFor(t, 2*time.Minute, 5*time.Second, func() error {
-		_, err := helpers.Kubectl(t, helpers.HostKubeconfig,
-			"get", "configmap", translated, "-n", ns)
+		_, err := helpers.Kubectl(t, helpers.HostKubeconfig, "get", "configmap", translated, "-n", ns)
 		return err
 	})
 
-	// Patch the virtual ConfigMap.
-	helpers.MustKubectl(t, vcKubeconfig,
-		"patch", "configmap", "mutable-cm",
-		"--type=merge", "-p", `{"data":{"rev":"v2"}}`)
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"patch", "configmap", cmName, "--type=merge", "-p", `{"data":{"rev":"v2"}}`)
 
-	// Verify the host shadow picks up the change.
 	helpers.MustWaitFor(t, 2*time.Minute, 5*time.Second, func() error {
 		out, err := helpers.Kubectl(t, helpers.HostKubeconfig,
-			"get", "configmap", translated, "-n", ns,
-			"-o", "jsonpath={.data.rev}")
+			"get", "configmap", translated, "-n", ns, "-o", "jsonpath={.data.rev}")
 		if err != nil {
 			return err
 		}
@@ -159,27 +156,22 @@ func TestConfigMapUpdatePropagation(t *testing.T) {
 	})
 }
 
-// TestNodeSyncHostToVirtual verifies that the syncer mirrors host nodes into
-// the virtual cluster as read-only Node objects.
+// TestNodeSyncHostToVirtual verifies that host nodes appear in the shared
+// vcluster as read-only Node objects.
 func TestNodeSyncHostToVirtual(t *testing.T) {
-	name := helpers.UniqueName("nds")
-	defer helpers.DumpDebug(t, "vc-"+name)
+	t.Parallel()
 
-	vcKubeconfig := helpers.CreateVCluster(t, name)
-
-	// Get node count from host.
 	hostOut := helpers.MustKubectl(t, helpers.HostKubeconfig, "get", "nodes", "-o", "name")
 	hostNodeCount := len(strings.Fields(strings.TrimSpace(hostOut)))
 
-	// Virtual cluster should see the same nodes.
 	helpers.MustWaitFor(t, 2*time.Minute, 5*time.Second, func() error {
-		vcOut, err := helpers.Kubectl(t, vcKubeconfig, "get", "nodes", "-o", "name")
+		vcOut, err := helpers.Kubectl(t, helpers.SharedVCKubeconfig, "get", "nodes", "-o", "name")
 		if err != nil {
 			return err
 		}
 		vcNodeCount := len(strings.Fields(strings.TrimSpace(vcOut)))
 		if vcNodeCount < hostNodeCount {
-			return fmt.Errorf("virtual cluster has %d nodes, expected at least %d", vcNodeCount, hostNodeCount)
+			return fmt.Errorf("virtual cluster has %d nodes, want at least %d", vcNodeCount, hostNodeCount)
 		}
 		return nil
 	})

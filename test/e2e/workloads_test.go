@@ -11,84 +11,79 @@ import (
 	"github.com/eatsoup/vibecluster/test/e2e/helpers"
 )
 
-// TestNginxDeployment creates a virtual cluster, deploys nginx, waits for the
-// pod to reach Running, and confirms the syncer has mirrored it into the host
+// TestNginxDeployment deploys nginx into the shared vcluster, waits for the
+// pod to reach Running, and confirms the syncer mirrors it into the host
 // namespace under the translated name.
 func TestNginxDeployment(t *testing.T) {
-	name := helpers.UniqueName("wl")
-	ns := "vc-" + name
+	t.Parallel()
+	ns := "vc-" + helpers.SharedVCName
 	defer helpers.DumpDebug(t, ns)
 
-	vcKubeconfig := helpers.CreateVCluster(t, name)
+	deplName := helpers.UniqueName("nginx")
 
-	// Deploy nginx into the virtual cluster.
-	helpers.MustKubectl(t, vcKubeconfig,
-		"create", "deployment", "nginx", "--image=nginx:alpine", "--replicas=1")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"create", "deployment", deplName, "--image=nginx:alpine", "--replicas=1")
+	t.Cleanup(func() {
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "deployment", deplName, "--ignore-not-found") //nolint:errcheck
+	})
 
-	// Wait for the deployment's pod to be Running inside the virtual cluster.
-	helpers.WaitForPodRunning(t, vcKubeconfig, "default", "app=nginx", 5*time.Minute)
+	helpers.WaitForPodRunning(t, helpers.SharedVCKubeconfig, "default", "app="+deplName, 5*time.Minute)
 
-	// The syncer translates virtual pod names to the pattern:
-	//   <clustername>-x-<podname>-x-<namespace>
-	// Verify at least one pod with the expected prefix exists in the host namespace.
+	// Syncer name translation: <clustername>-x-<podname>-x-<namespace>
+	prefix := helpers.SharedVCName + "-x-" + deplName
 	helpers.MustWaitFor(t, 2*time.Minute, 5*time.Second, func() error {
 		out, err := helpers.Kubectl(t, helpers.HostKubeconfig,
 			"get", "pods", "-n", ns, "-o", "jsonpath={.items[*].metadata.name}")
 		if err != nil {
 			return err
 		}
-		prefix := name + "-x-nginx"
 		for _, podName := range strings.Fields(out) {
 			if strings.HasPrefix(podName, prefix) {
 				return nil
 			}
 		}
-		return fmt.Errorf("no host pod with prefix %q found; got: %s", prefix, out)
+		return fmt.Errorf("no host pod with prefix %q; got: %s", prefix, out)
 	})
 }
 
-// TestPodToPodCommunication deploys two services inside a virtual cluster and
+// TestPodToPodCommunication deploys two workloads in the shared vcluster and
 // verifies that a curl from one pod reaches the other via ClusterIP service.
 func TestPodToPodCommunication(t *testing.T) {
-	name := helpers.UniqueName("p2p")
-	ns := "vc-" + name
-	defer helpers.DumpDebug(t, ns)
+	t.Parallel()
+	defer helpers.DumpDebug(t, "vc-"+helpers.SharedVCName)
 
-	vcKubeconfig := helpers.CreateVCluster(t, name)
+	svcName := helpers.UniqueName("svc")
+	clientName := helpers.UniqueName("client")
 
-	// Deploy a simple HTTP server (nginx) and expose it.
-	helpers.MustKubectl(t, vcKubeconfig,
-		"create", "deployment", "server", "--image=nginx:alpine")
-	helpers.MustKubectl(t, vcKubeconfig,
-		"expose", "deployment", "server", "--port=80", "--name=server-svc")
-
-	// Deploy a curl client pod.
-	helpers.MustKubectl(t, vcKubeconfig,
-		"run", "client", "--image=curlimages/curl:latest",
-		"--restart=Never",
-		"--command", "--", "sleep", "3600")
-
-	// Wait for both pods to be Running.
-	helpers.WaitForPodRunning(t, vcKubeconfig, "default", "app=server", 5*time.Minute)
-	helpers.MustWaitFor(t, 3*time.Minute, 5*time.Second, func() error {
-		out, err := helpers.Kubectl(t, vcKubeconfig,
-			"get", "pod", "client", "-o", "jsonpath={.status.phase}")
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(out) != "Running" {
-			return fmt.Errorf("client pod phase: %s", out)
-		}
-		return nil
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"create", "deployment", svcName, "--image=nginx:alpine")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"expose", "deployment", svcName, "--port=80", "--name="+svcName)
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"run", clientName, "--image=curlimages/curl:latest",
+		"--restart=Never", "--command", "--", "sleep", "3600")
+	t.Cleanup(func() {
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "deployment", svcName, "--ignore-not-found")   //nolint:errcheck
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "svc", svcName, "--ignore-not-found")         //nolint:errcheck
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", clientName, "--ignore-not-found")       //nolint:errcheck
 	})
 
-	// curl from the client pod to the server's ClusterIP service.
+	helpers.WaitForPodRunning(t, helpers.SharedVCKubeconfig, "default", "app="+svcName, 5*time.Minute)
+	helpers.MustWaitFor(t, 3*time.Minute, 5*time.Second, func() error {
+		out, _ := helpers.Kubectl(t, helpers.SharedVCKubeconfig,
+			"get", "pod", clientName, "-o", "jsonpath={.status.phase}")
+		if strings.TrimSpace(out) == "Running" {
+			return nil
+		}
+		return fmt.Errorf("client pod phase: %s", out)
+	})
+
 	helpers.MustWaitFor(t, 60*time.Second, 5*time.Second, func() error {
-		out, err := helpers.KubectlExec(t, vcKubeconfig,
-			"default", "client", "client",
-			"curl", "-sf", "--max-time", "5", "http://server-svc/")
+		out, err := helpers.KubectlExec(t, helpers.SharedVCKubeconfig,
+			"default", clientName, clientName,
+			"curl", "-sf", "--max-time", "5", "http://"+svcName+"/")
 		if err != nil {
-			return fmt.Errorf("curl failed: %v", err)
+			return fmt.Errorf("curl: %v", err)
 		}
 		if !strings.Contains(out, "Welcome to nginx") {
 			return fmt.Errorf("unexpected response: %s", out)
@@ -97,64 +92,67 @@ func TestPodToPodCommunication(t *testing.T) {
 	})
 }
 
-// TestDNSResolution verifies that a pod inside the virtual cluster can resolve
-// another service by its full DNS name (<svc>.<ns>.svc.cluster.local).
+// TestDNSResolution verifies FQDN resolution inside the shared vcluster.
 func TestDNSResolution(t *testing.T) {
-	name := helpers.UniqueName("dns")
-	ns := "vc-" + name
-	defer helpers.DumpDebug(t, ns)
+	t.Parallel()
+	defer helpers.DumpDebug(t, "vc-"+helpers.SharedVCName)
 
-	vcKubeconfig := helpers.CreateVCluster(t, name)
+	webName := helpers.UniqueName("web")
+	resolverName := helpers.UniqueName("res")
 
-	helpers.MustKubectl(t, vcKubeconfig,
-		"create", "deployment", "web", "--image=nginx:alpine")
-	helpers.MustKubectl(t, vcKubeconfig,
-		"expose", "deployment", "web", "--port=80", "--name=web-svc")
-	helpers.MustKubectl(t, vcKubeconfig,
-		"run", "resolver", "--image=curlimages/curl:latest",
-		"--restart=Never",
-		"--command", "--", "sleep", "3600")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"create", "deployment", webName, "--image=nginx:alpine")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"expose", "deployment", webName, "--port=80", "--name="+webName)
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"run", resolverName, "--image=curlimages/curl:latest",
+		"--restart=Never", "--command", "--", "sleep", "3600")
+	t.Cleanup(func() {
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "deployment", webName, "--ignore-not-found") //nolint:errcheck
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "svc", webName, "--ignore-not-found")       //nolint:errcheck
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", resolverName, "--ignore-not-found")  //nolint:errcheck
+	})
 
-	helpers.WaitForPodRunning(t, vcKubeconfig, "default", "app=web", 5*time.Minute)
+	helpers.WaitForPodRunning(t, helpers.SharedVCKubeconfig, "default", "app="+webName, 5*time.Minute)
 	helpers.MustWaitFor(t, 3*time.Minute, 5*time.Second, func() error {
-		out, _ := helpers.Kubectl(t, vcKubeconfig,
-			"get", "pod", "resolver", "-o", "jsonpath={.status.phase}")
+		out, _ := helpers.Kubectl(t, helpers.SharedVCKubeconfig,
+			"get", "pod", resolverName, "-o", "jsonpath={.status.phase}")
 		if strings.TrimSpace(out) == "Running" {
 			return nil
 		}
 		return fmt.Errorf("resolver pod phase: %s", out)
 	})
 
-	// Use the full FQDN.
-	fqdn := "web-svc.default.svc.cluster.local"
+	fqdn := webName + ".default.svc.cluster.local"
 	helpers.MustWaitFor(t, 60*time.Second, 5*time.Second, func() error {
-		_, err := helpers.KubectlExec(t, vcKubeconfig,
-			"default", "resolver", "resolver",
+		_, err := helpers.KubectlExec(t, helpers.SharedVCKubeconfig,
+			"default", resolverName, resolverName,
 			"curl", "-sf", "--max-time", "5", "http://"+fqdn+"/")
 		return err
 	})
 }
 
-// TestConfigMapMount creates a ConfigMap and a Pod that reads it via an
-// environment variable, confirming the virtual cluster can mount ConfigMaps.
+// TestConfigMapMount creates a ConfigMap and Pod in the shared vcluster that
+// reads it via an environment variable.
 func TestConfigMapMount(t *testing.T) {
-	name := helpers.UniqueName("cm")
-	ns := "vc-" + name
-	defer helpers.DumpDebug(t, ns)
+	t.Parallel()
+	defer helpers.DumpDebug(t, "vc-"+helpers.SharedVCName)
 
-	vcKubeconfig := helpers.CreateVCluster(t, name)
+	cmName := helpers.UniqueName("cm")
+	podName := helpers.UniqueName("reader")
 
-	// Create a ConfigMap with a key.
-	helpers.MustKubectl(t, vcKubeconfig,
-		"create", "configmap", "app-config",
-		"--from-literal=MESSAGE=hello-from-configmap")
+	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
+		"create", "configmap", cmName, "--from-literal=MESSAGE=hello-"+cmName)
+	t.Cleanup(func() {
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "configmap", cmName, "--ignore-not-found") //nolint:errcheck
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", podName, "--ignore-not-found")      //nolint:errcheck
+	})
 
-	// Run a pod that reads the ConfigMap key as an env var and prints it.
-	podYAML := `
+	helpers.MustKubectlApply(t, helpers.SharedVCKubeconfig, fmt.Sprintf(`
 apiVersion: v1
 kind: Pod
 metadata:
-  name: cm-reader
+  name: %s
 spec:
   restartPolicy: Never
   containers:
@@ -165,31 +163,27 @@ spec:
     - name: MESSAGE
       valueFrom:
         configMapKeyRef:
-          name: app-config
+          name: %s
           key: MESSAGE
-`
-	helpers.MustKubectlApply(t, vcKubeconfig, podYAML)
+`, podName, cmName))
 
-	// Wait for the pod to complete.
 	helpers.MustWaitFor(t, 5*time.Minute, 5*time.Second, func() error {
-		out, err := helpers.Kubectl(t, vcKubeconfig,
-			"get", "pod", "cm-reader", "-o", "jsonpath={.status.phase}")
+		out, err := helpers.Kubectl(t, helpers.SharedVCKubeconfig,
+			"get", "pod", podName, "-o", "jsonpath={.status.phase}")
 		if err != nil {
 			return err
 		}
-		phase := strings.TrimSpace(out)
-		if phase == "Succeeded" {
+		if strings.TrimSpace(out) == "Succeeded" {
 			return nil
 		}
-		return fmt.Errorf("pod phase: %s", phase)
+		return fmt.Errorf("pod phase: %s", out)
 	})
 
-	// Verify the pod logged the expected message.
-	logs, err := helpers.Kubectl(t, vcKubeconfig, "logs", "cm-reader")
+	logs, err := helpers.Kubectl(t, helpers.SharedVCKubeconfig, "logs", podName)
 	if err != nil {
 		t.Fatalf("getting pod logs: %v", err)
 	}
-	if !strings.Contains(logs, "hello-from-configmap") {
+	if !strings.Contains(logs, "hello-"+cmName) {
 		t.Errorf("expected ConfigMap value in pod logs; got:\n%s", logs)
 	}
 }

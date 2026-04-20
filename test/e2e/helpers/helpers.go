@@ -15,16 +15,18 @@ import (
 	"testing"
 	"time"
 
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 // Globals set by TestMain before any test runs.
 var (
-	VibeclusterBin  string // path to the vibecluster binary
-	HostKubeconfig  string // kubeconfig for the k3d host cluster
-	SyncerImage     string // syncer image to use when creating vclusters
-	OperatorImage   string // operator image to use when installing the operator
+	VibeclusterBin    string // path to the vibecluster binary
+	HostKubeconfig    string // kubeconfig for the k3d host cluster
+	SyncerImage       string // syncer image to use when creating vclusters
+	OperatorImage     string // operator image to use when installing the operator
+	SharedVCName      string // name of the shared vcluster created in TestMain
+	SharedVCKubeconfig string // kubeconfig path for the shared vcluster
 )
 
 // UniqueName returns a short unique name safe for use as a Kubernetes resource name.
@@ -247,6 +249,123 @@ func GetVClusterKubeconfig(t *testing.T, name string) string {
 	})
 
 	return kcPath
+}
+
+// SetupSharedVCluster creates a vcluster and returns the kubeconfig path.
+// It is intended for use in TestMain where no *testing.T is available.
+// Errors are returned rather than calling t.Fatal.
+func SetupSharedVCluster(name string) (string, error) {
+	ns := "vc-" + name
+	pod := name + "-0"
+
+	// Wait up to 5 min for the pod to be Running.
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		cmd := exec.Command("kubectl", "--kubeconfig", HostKubeconfig,
+			"get", "pod", pod, "-n", ns, "-o", "jsonpath={.status.phase}")
+		out, err := cmd.Output()
+		if err == nil && strings.TrimSpace(string(out)) == "Running" {
+			break
+		}
+		time.Sleep(5 * time.Second)
+		if !time.Now().Before(deadline) {
+			return "", fmt.Errorf("pod %s/%s did not reach Running within 5m", ns, pod)
+		}
+	}
+
+	// Find a free port and start port-forward.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", fmt.Errorf("finding free port: %w", err)
+	}
+	localPort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pfCmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", HostKubeconfig,
+		"port-forward", "-n", ns, "pod/"+pod,
+		fmt.Sprintf("%d:6443", localPort))
+	pfCmd.Stdout = os.Stderr
+	pfCmd.Stderr = os.Stderr
+	if err := pfCmd.Start(); err != nil {
+		cancel()
+		return "", fmt.Errorf("starting port-forward: %w", err)
+	}
+
+	// Wait for port to accept connections.
+	addr := fmt.Sprintf("127.0.0.1:%d", localPort)
+	for i := 0; i < 30; i++ {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Extract TLS credentials.
+	caData, err := execInPodRaw(ns, pod, "k3s", "cat", "/data/k3s/server/tls/server-ca.crt")
+	if err != nil {
+		cancel()
+		pfCmd.Wait()
+		return "", fmt.Errorf("reading CA: %w", err)
+	}
+	clientCert, err := execInPodRaw(ns, pod, "k3s", "cat", "/data/k3s/server/tls/client-admin.crt")
+	if err != nil {
+		cancel()
+		pfCmd.Wait()
+		return "", fmt.Errorf("reading client cert: %w", err)
+	}
+	clientKey, err := execInPodRaw(ns, pod, "k3s", "cat", "/data/k3s/server/tls/client-admin.key")
+	if err != nil {
+		cancel()
+		pfCmd.Wait()
+		return "", fmt.Errorf("reading client key: %w", err)
+	}
+
+	kcPath := filepath.Join(os.TempDir(), "vibecluster-e2e-shared.kubeconfig")
+	cfg := &clientcmdapi.Config{
+		Clusters: map[string]*clientcmdapi.Cluster{
+			"vibe-" + name: {Server: fmt.Sprintf("https://127.0.0.1:%d", localPort), InsecureSkipTLSVerify: true},
+		},
+		AuthInfos: map[string]*clientcmdapi.AuthInfo{
+			"vibe-" + name: {ClientCertificateData: []byte(strings.TrimSpace(string(clientCert))), ClientKeyData: []byte(strings.TrimSpace(string(clientKey)))},
+		},
+		Contexts: map[string]*clientcmdapi.Context{
+			"vibe-" + name: {Cluster: "vibe-" + name, AuthInfo: "vibe-" + name},
+		},
+		CurrentContext: "vibe-" + name,
+	}
+	_ = caData // CA not used; insecure-skip-tls-verify instead
+	if err := clientcmd.WriteToFile(*cfg, kcPath); err != nil {
+		cancel()
+		pfCmd.Wait()
+		return "", fmt.Errorf("writing kubeconfig: %w", err)
+	}
+
+	// Smoke-test connectivity.
+	for i := 0; i < 20; i++ {
+		cmd := exec.Command("kubectl", "--kubeconfig", kcPath, "get", "nodes")
+		if err := cmd.Run(); err == nil {
+			// Keep port-forward running in background (lives until process exits).
+			go func() {
+				pfCmd.Wait() //nolint:errcheck
+			}()
+			_ = cancel // intentionally leaked; lives for the test process lifetime
+			return kcPath, nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	cancel()
+	pfCmd.Wait()
+	return "", fmt.Errorf("shared vcluster API not reachable after 60s")
+}
+
+func execInPodRaw(ns, pod, container string, cmd ...string) ([]byte, error) {
+	args := append([]string{"--kubeconfig", HostKubeconfig,
+		"exec", pod, "-n", ns, "-c", container, "--"}, cmd...)
+	return exec.Command("kubectl", args...).Output()
 }
 
 // writeKubeconfig writes a kubeconfig that uses insecure-skip-tls-verify so

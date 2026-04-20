@@ -5,51 +5,57 @@ package e2e
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/eatsoup/vibecluster/test/e2e/helpers"
 )
 
-// operatorInstalled tracks whether we've already installed the operator in
-// this test run; operator tests share the install so we only pay the cost once.
-var operatorInstalled bool
+var (
+	operatorOnce      sync.Once
+	operatorInstalled bool
+)
 
-// ensureOperator installs the vibecluster operator if it is not yet installed.
-// It registers teardown via t.Cleanup on the first call; subsequent calls are
-// no-ops.
+// ensureOperator installs the vibecluster operator exactly once across all
+// parallel test goroutines and blocks until it is ready.
 func ensureOperator(t *testing.T) {
 	t.Helper()
-	if operatorInstalled {
-		return
-	}
-
-	args := []string{"operator", "install"}
-	if helpers.OperatorImage != "" {
-		args = append(args, "--image", helpers.OperatorImage)
-	}
-	helpers.MustVibeCluster(t, args...)
-
-	// Wait for the operator Deployment to become ready.
-	helpers.MustWaitFor(t, 3*time.Minute, 5*time.Second, func() error {
-		out, err := helpers.Kubectl(t, helpers.HostKubeconfig,
-			"get", "deployment", "-n", "vibecluster-system",
-			"-o", "jsonpath={.items[*].status.readyReplicas}")
-		if err != nil {
-			return err
+	operatorOnce.Do(func() {
+		args := []string{"operator", "install"}
+		if helpers.OperatorImage != "" {
+			args = append(args, "--image", helpers.OperatorImage)
 		}
-		if strings.TrimSpace(out) == "" || strings.TrimSpace(out) == "0" {
-			return fmt.Errorf("operator deployment not ready yet")
+		if _, err := helpers.RunVibeCluster(t, args...); err != nil {
+			t.Errorf("operator install: %v", err)
+			return
 		}
-		return nil
+		if err := helpers.WaitFor(t, 3*time.Minute, 5*time.Second, func() error {
+			out, err := helpers.Kubectl(t, helpers.HostKubeconfig,
+				"get", "deployment", "-n", "vibecluster-system",
+				"-o", "jsonpath={.items[*].status.readyReplicas}")
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(out) == "" || strings.TrimSpace(out) == "0" {
+				return fmt.Errorf("operator deployment not ready yet")
+			}
+			return nil
+		}); err != nil {
+			t.Errorf("waiting for operator: %v", err)
+			return
+		}
+		operatorInstalled = true
 	})
-
-	operatorInstalled = true
+	if !operatorInstalled {
+		t.Skip("operator install failed; skipping operator test")
+	}
 }
 
 // TestOperatorInstall verifies that `vibecluster operator install` creates the
 // operator Deployment in the vibecluster-system namespace and that it becomes Ready.
 func TestOperatorInstall(t *testing.T) {
+	t.Parallel()
 	ensureOperator(t)
 
 	// Deployment must exist and be ready (ensureOperator already waits, but
@@ -72,6 +78,7 @@ func TestOperatorInstall(t *testing.T) {
 // TestOperatorCRCreate applies a VirtualCluster CR and verifies the operator
 // reconciles it to phase=Running with a backing host namespace.
 func TestOperatorCRCreate(t *testing.T) {
+	t.Parallel()
 	ensureOperator(t)
 
 	name := helpers.UniqueName("op")
@@ -136,6 +143,7 @@ spec:
 // TestOperatorCRDelete verifies that deleting a VirtualCluster CR causes the
 // operator to clean up the host namespace.
 func TestOperatorCRDelete(t *testing.T) {
+	t.Parallel()
 	ensureOperator(t)
 
 	name := helpers.UniqueName("opd")
@@ -184,6 +192,8 @@ spec:
 // TestOperatorUninstall verifies that `vibecluster operator uninstall` removes
 // the controller Deployment and CRD, while leaving any existing vclusters intact.
 func TestOperatorUninstall(t *testing.T) {
+	// Intentionally NOT parallel — uninstalling the operator would race with
+	// TestOperatorCRCreate / TestOperatorCRDelete if they ran concurrently.
 	// This test must run last among operator tests because it removes the operator.
 	// Any clusters created before this point (and still running) should survive.
 

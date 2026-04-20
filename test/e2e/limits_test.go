@@ -17,6 +17,7 @@ import (
 // `vibecluster create` installs a ResourceQuota and LimitRange on the
 // vcluster's host namespace.
 func TestResourceLimitsInstalled(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("lim")
 	ns := "vc-" + name
 	defer helpers.DumpDebug(t, ns)
@@ -68,6 +69,7 @@ func TestResourceLimitsInstalled(t *testing.T) {
 // namespace pod count reaches the quota, additional pod creation is rejected
 // by the Kubernetes admission control layer.
 func TestPodsCapEnforced(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("cap")
 	ns := "vc-" + name
 	defer helpers.DumpDebug(t, ns)
@@ -121,6 +123,7 @@ spec:
 // the ResourceQuota supplies default requests so that pods without explicit
 // resource requests are still admitted under the quota.
 func TestPodsWithoutRequestsAdmit(t *testing.T) {
+	t.Parallel()
 	name := helpers.UniqueName("lr")
 	ns := "vc-" + name
 	defer helpers.DumpDebug(t, ns)
