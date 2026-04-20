@@ -1,0 +1,51 @@
+name: e2e
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'vibecluster.png'
+      - 'LICENSE'
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Build binary
+        run: make build
+
+      - name: Build syncer image
+        run: docker build -f Dockerfile.syncer -t ghcr.io/eatsoup/vibecluster/syncer:e2e .
+
+      - name: Build operator image
+        run: docker build -f Dockerfile.operator -t ghcr.io/eatsoup/vibecluster/operator:e2e .
+
+      - name: Run e2e suite
+        env:
+          VIBC_BIN: ${{ github.workspace }}/bin/vibecluster
+          VIBC_SYNCER_IMAGE: ghcr.io/eatsoup/vibecluster/syncer:e2e
+          VIBC_OPERATOR_IMAGE: ghcr.io/eatsoup/vibecluster/operator:e2e
+        run: |
+          go test -v -tags e2e -timeout 45m ./test/e2e/... 2>&1 | tee e2e.log
+
+      - name: Upload e2e log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-log
+          path: e2e.log
+          retention-days: 7
