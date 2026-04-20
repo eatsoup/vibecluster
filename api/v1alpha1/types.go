@@ -50,6 +50,10 @@ type VirtualClusterSpec struct {
 	// run. Only meaningful when VNode is true — in non-vnode mode there
 	// is no real kubelet to scale. Each extra node is a privileged pod
 	// costing ~200m CPU / 512Mi–2Gi memory, so scale deliberately.
+	//
+	// Scale-down does not currently drain the target node: workloads on
+	// the removed agent pod will be killed when the pod terminates.
+	// Cordon + drain the virtual node before shrinking spec.nodes.
 	// +optional
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1

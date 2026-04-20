@@ -61,7 +61,7 @@ func newCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.storage, "storage", "", "total persistent storage budget across all PVCs (e.g. 50Gi); enforced via a namespace ResourceQuota.")
 	cmd.Flags().Int32Var(&opts.pods, "pods", 0, "maximum pod count in the virtual cluster (0 = unlimited).")
 	cmd.Flags().BoolVar(&opts.vnode, "vnode", false, "run a nested k3s agent pod so NetworkPolicy and LoadBalancer work inside the virtual cluster. Requires privileged pods on the host.")
-	cmd.Flags().Int32Var(&opts.nodes, "nodes", 1, "number of virtual worker nodes (vnode agents). Only valid with --vnode. Each extra node is a privileged pod, so scale deliberately.")
+	cmd.Flags().Int32Var(&opts.nodes, "nodes", 1, "number of virtual worker nodes (vnode agents). Only valid with --vnode. Each extra node is a privileged pod, so scale deliberately. Cordon + drain the target node before shrinking; scale-down does not drain workloads.")
 
 	return cmd
 }

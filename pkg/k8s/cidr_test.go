@@ -175,3 +175,49 @@ func TestCreateVirtualCluster_VNodeNodesProducesStatefulSet(t *testing.T) {
 		t.Errorf("vnode headless service not created: %v", err)
 	}
 }
+
+func TestCreateVirtualCluster_MultiNodeVNodesGetDistinctCIDRs(t *testing.T) {
+	// Issue #32: two vnode vclusters on one host, each with N>1, must still
+	// get distinct pod/service CIDRs. Replica count is orthogonal to CIDR
+	// allocation (one allocation per vcluster, not per agent pod) — lock it
+	// in with a test so a future refactor can't tie the two together.
+	client := fake.NewSimpleClientset()
+	ctx := context.Background()
+
+	if err := CreateVirtualCluster(ctx, client, "a", CreateOptions{VNode: true, Nodes: 3}); err != nil {
+		t.Fatalf("CreateVirtualCluster a: %v", err)
+	}
+	if err := CreateVirtualCluster(ctx, client, "b", CreateOptions{VNode: true, Nodes: 3}); err != nil {
+		t.Fatalf("CreateVirtualCluster b: %v", err)
+	}
+
+	nsA, err := client.CoreV1().Namespaces().Get(ctx, "vc-a", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("ns vc-a: %v", err)
+	}
+	nsB, err := client.CoreV1().Namespaces().Get(ctx, "vc-b", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("ns vc-b: %v", err)
+	}
+	if nsA.Annotations[AnnotationPodCIDR] == nsB.Annotations[AnnotationPodCIDR] {
+		t.Errorf("pod CIDRs collide: a=%s b=%s", nsA.Annotations[AnnotationPodCIDR], nsB.Annotations[AnnotationPodCIDR])
+	}
+	if nsA.Annotations[AnnotationServiceCIDR] == nsB.Annotations[AnnotationServiceCIDR] {
+		t.Errorf("service CIDRs collide: a=%s b=%s", nsA.Annotations[AnnotationServiceCIDR], nsB.Annotations[AnnotationServiceCIDR])
+	}
+
+	stsA, err := client.AppsV1().StatefulSets("vc-a").Get(ctx, "a-vnode", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("sts a: %v", err)
+	}
+	stsB, err := client.AppsV1().StatefulSets("vc-b").Get(ctx, "b-vnode", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("sts b: %v", err)
+	}
+	if stsA.Spec.Replicas == nil || *stsA.Spec.Replicas != 3 {
+		t.Errorf("a replicas = %v, want 3", stsA.Spec.Replicas)
+	}
+	if stsB.Spec.Replicas == nil || *stsB.Spec.Replicas != 3 {
+		t.Errorf("b replicas = %v, want 3", stsB.Spec.Replicas)
+	}
+}

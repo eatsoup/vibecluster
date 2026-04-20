@@ -86,7 +86,7 @@ spec:
                   type: boolean
                   default: false
                 nodes:
-                  description: Nodes is the number of virtual worker nodes (vnode agent pods) to run. Only meaningful when vnode is true — in non-vnode mode there is no real kubelet to scale. Each extra node is a privileged pod costing ~200m CPU / 512Mi–2Gi memory.
+                  description: Nodes is the number of virtual worker nodes (vnode agent pods) to run. Only meaningful when vnode is true — in non-vnode mode there is no real kubelet to scale. Each extra node is a privileged pod costing ~200m CPU / 512Mi–2Gi memory. Scale-down does not drain workloads; cordon + drain the target node before shrinking.
                   type: integer
                   format: int32
                   minimum: 1
