@@ -59,6 +59,10 @@ type VirtualClusterCRSpec struct {
 	Resources *ResourceLimits
 	// VNode enables nested data-plane mode.
 	VNode bool
+	// Nodes is the number of vnode agent replicas. Only meaningful when
+	// VNode is true. Zero/one both mean "default" and are omitted so the
+	// CRD default (1) applies.
+	Nodes int32
 }
 
 // VirtualClusterCRExpose mirrors api/v1alpha1.VirtualClusterExpose for the CLI.
@@ -125,6 +129,10 @@ func createVirtualClusterCRWith(ctx context.Context, dynClient dynamic.Interface
 	}
 	if spec.VNode {
 		specMap["vnode"] = true
+	}
+	if spec.Nodes > 1 {
+		// Only set when the user asked for >1; let the CRD default apply otherwise.
+		specMap["nodes"] = int64(spec.Nodes)
 	}
 
 	obj := &unstructured.Unstructured{

@@ -31,10 +31,23 @@ type CreateOptions struct {
 	Resources *ResourceLimits
 	// VNode enables nested data-plane mode: the k3s server is configured
 	// with flannel + network-policy + servicelb, the flat workload syncer
-	// is disabled, and a privileged Deployment runs k3s agent joined to
-	// the virtual server so real workloads run inside an in-vcluster
+	// is disabled, and a privileged StatefulSet runs k3s agent(s) joined
+	// to the virtual server so real workloads run inside an in-vcluster
 	// kubelet.
 	VNode bool
+	// Nodes is the number of vnode agent replicas (virtual worker nodes).
+	// Only meaningful when VNode is true. Zero is treated as 1.
+	Nodes int32
+}
+
+// vnodeReplicas returns the effective vnode replica count, defaulting to 1
+// when nodes is unset (zero). Kept next to CreateOptions so the CLI path
+// and the builder both share the same rule.
+func vnodeReplicas(nodes int32) int32 {
+	if nodes < 1 {
+		return 1
+	}
+	return nodes
 }
 
 // CreateVirtualCluster deploys all resources for a virtual cluster.
@@ -115,12 +128,12 @@ func CreateVirtualCluster(ctx context.Context, client kubernetes.Interface, name
 		return fmt.Errorf("creating statefulset: %w", err)
 	}
 
-	// 8. In vnode mode, create the privileged k3s-agent Deployment that
-	//    acts as the single virtual node.
+	// 8. In vnode mode, create the headless Service and privileged k3s-agent
+	//    StatefulSet that form the virtual worker nodes.
 	if opts.VNode {
-		fmt.Printf("  Creating vnode agent Deployment...\n")
-		if err := createVNodeDeployment(ctx, client, name, ns, labels, opts.ImagePullSecret); err != nil {
-			return fmt.Errorf("creating vnode deployment: %w", err)
+		fmt.Printf("  Creating vnode agent StatefulSet (%d replica(s))...\n", vnodeReplicas(opts.Nodes))
+		if err := createVNodeStatefulSet(ctx, client, name, ns, opts.ImagePullSecret, opts.Nodes); err != nil {
+			return fmt.Errorf("creating vnode statefulset: %w", err)
 		}
 	}
 
@@ -648,131 +661,26 @@ func VNodeAgentToken(name string) string {
 	return "vibecluster-vnode-" + name
 }
 
-// createVNodeDeployment stands up the privileged k3s-agent Deployment that
-// forms the single virtual node for a vnode-mode cluster.
-//
-// The agent joins the virtual k3s server via the in-cluster Service DNS
-// name (which is in the server cert's SAN list), using the deterministic
-// per-vcluster token.
-//
-// This pod needs privileged: true on a stock host cluster: the embedded
-// kubelet mounts cgroups, the CNI (flannel) manipulates iptables/netlink,
-// and containerd-in-containerd needs /dev access.
-func createVNodeDeployment(ctx context.Context, client kubernetes.Interface, name, ns string, labels map[string]string, imagePullSecret string) error {
-	depName := name + "-vnode"
-	// Intentionally do NOT copy the base labels — the main Service and the
-	// headless Service select on `app: vibecluster`, so carrying that label
-	// here would make the API server Service load-balance between the k3s
-	// server pod and the vnode pod (which doesn't listen on 6443).
-	depLabels := map[string]string{
-		LabelManagedBy:              LabelManagedByValue,
-		LabelVClusterName:           name,
-		"vibecluster.dev/component": "vnode",
+// createVNodeStatefulSet stands up the privileged k3s-agent StatefulSet
+// (and its backing headless Service) that forms the virtual worker nodes
+// for a vnode-mode cluster. Pod spec is built by BuildVNodeStatefulSet so
+// this and the operator path stay in lockstep.
+func createVNodeStatefulSet(ctx context.Context, client kubernetes.Interface, name, ns, imagePullSecret string, nodes int32) error {
+	opts := BuilderOptions{
+		Name:            name,
+		Namespace:       ns,
+		ImagePullSecret: imagePullSecret,
+		Nodes:           nodes,
 	}
-
-	serverURL := "https://" + name + "." + ns + ".svc.cluster.local:" + fmt.Sprintf("%d", ServicePort)
-
-	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   depName,
-			Labels: depLabels,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To[int32](1),
-			Selector: &metav1.LabelSelector{MatchLabels: depLabels},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: depLabels},
-				Spec: corev1.PodSpec{
-					ServiceAccountName:            "vc-" + name,
-					TerminationGracePeriodSeconds: ptr.To[int64](10),
-					// Nested containerd exhausts the host's default
-					// fs.inotify.max_user_instances (128 on most distros)
-					// almost immediately — the same issue kind/k3d document
-					// for running Kubernetes-in-Docker. Bump it on the host
-					// via a privileged init container so vibecluster carries
-					// its own prerequisite instead of requiring a host-side
-					// sysctl edit from the operator.
-					InitContainers: []corev1.Container{
-						{
-							Name:  "sysctl",
-							Image: VNodeAgentImage,
-							Command: []string{"sh", "-c",
-								"sysctl -w fs.inotify.max_user_instances=8192 && sysctl -w fs.inotify.max_user_watches=1048576",
-							},
-							SecurityContext: &corev1.SecurityContext{
-								Privileged: ptr.To(true),
-								RunAsUser:  ptr.To[int64](0),
-							},
-						},
-					},
-					Containers: []corev1.Container{
-						{
-							Name:    "k3s-agent",
-							Image:   VNodeAgentImage,
-							Command: []string{"k3s"},
-							Args: []string{
-								"agent",
-								"--server=" + serverURL,
-								"--token=" + VNodeAgentToken(name),
-								"--node-name=$(NODE_NAME)",
-							},
-							Env: []corev1.EnvVar{
-								{
-									Name: "NODE_NAME",
-									ValueFrom: &corev1.EnvVarSource{
-										FieldRef: &corev1.ObjectFieldSelector{
-											FieldPath: "metadata.name",
-										},
-									},
-								},
-							},
-							SecurityContext: &corev1.SecurityContext{
-								Privileged: ptr.To(true),
-								RunAsUser:  ptr.To[int64](0),
-							},
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("200m"),
-									corev1.ResourceMemory: resource.MustParse("512Mi"),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceMemory: resource.MustParse("2Gi"),
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "k3s-data", MountPath: "/var/lib/rancher/k3s"},
-								{Name: "kubelet", MountPath: "/var/lib/kubelet"},
-								{Name: "cni-bin", MountPath: "/opt/cni/bin"},
-								{Name: "cni-conf", MountPath: "/etc/cni/net.d"},
-								{Name: "modules", MountPath: "/lib/modules", ReadOnly: true},
-							},
-						},
-					},
-					Volumes: []corev1.Volume{
-						{Name: "k3s-data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-						{Name: "kubelet", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-						{Name: "cni-bin", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-						{Name: "cni-conf", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-						{
-							Name: "modules",
-							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{Path: "/lib/modules"},
-							},
-						},
-					},
-				},
-			},
-		},
+	svc := BuildVNodeHeadlessService(opts)
+	if _, err := client.CoreV1().Services(ns).Create(ctx, svc, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("creating vnode headless service: %w", err)
 	}
-
-	if imagePullSecret != "" {
-		dep.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
-			{Name: imagePullSecret},
-		}
+	sts := BuildVNodeStatefulSet(opts)
+	if _, err := client.AppsV1().StatefulSets(ns).Create(ctx, sts, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("creating vnode statefulset: %w", err)
 	}
-
-	_, err := client.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{})
-	return err
+	return nil
 }
 
 // BuildIngress returns an Ingress resource for the virtual cluster.

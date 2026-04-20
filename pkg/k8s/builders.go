@@ -45,13 +45,25 @@ type BuilderOptions struct {
 	Resources *ResourceLimits
 	// VNode enables the nested data-plane mode: the k3s server is configured
 	// with flannel + network-policy + servicelb + coredns, the flat workload
-	// syncer is disabled, and a privileged Deployment runs k3s agent joined
-	// to the virtual server so real workloads run inside an in-vcluster
-	// kubelet.
+	// syncer is disabled, and a privileged StatefulSet runs k3s agent(s)
+	// joined to the virtual server so real workloads run inside an
+	// in-vcluster kubelet.
 	VNode bool
 	// VNodeCIDRs holds the allocated pod/service CIDR pair for vnode mode.
 	// Only meaningful when VNode is true.
 	VNodeCIDRs VNodeCIDRs
+	// Nodes is the number of vnode agent replicas (virtual worker nodes).
+	// Only meaningful when VNode is true. Zero is treated as 1.
+	Nodes int32
+}
+
+// VNodeReplicas returns the effective vnode replica count, defaulting to 1
+// when Nodes is unset.
+func (o BuilderOptions) VNodeReplicas() int32 {
+	if o.Nodes < 1 {
+		return 1
+	}
+	return o.Nodes
 }
 
 // ResourceLimits is the per-vcluster resource budget enforced via a
@@ -401,8 +413,8 @@ func BuildHeadlessService(opts BuilderOptions) *corev1.Service {
 // It is exported via BuildStatefulSet — kept separate so the expose host
 // can be appended to the TLS-SAN list when set. In vnode mode the
 // networking defaults are left on (flannel, network-policy, servicelb,
-// coredns) because a real agent Deployment joins the cluster and runs
-// those components — see BuildVNodeDeployment.
+// coredns) because a real agent StatefulSet joins the cluster and runs
+// those components — see BuildVNodeStatefulSet.
 func k3sArgs(opts BuilderOptions) []string {
 	tlsSAN := []string{
 		"--tls-san=" + opts.Name + "." + opts.Namespace + ".svc.cluster.local",
@@ -644,39 +656,85 @@ func syncerEnv(opts BuilderOptions) []corev1.EnvVar {
 	return env
 }
 
-// BuildVNodeDeployment returns the privileged k3s-agent Deployment that
-// forms the single virtual node for a vnode-mode cluster. The agent joins
-// the virtual k3s server via the in-cluster Service DNS name, using the
-// deterministic per-vcluster token.
-//
-// This pod needs privileged: true on a stock host cluster: the embedded
-// kubelet mounts cgroups, the CNI (flannel) manipulates iptables/netlink,
-// and containerd-in-containerd needs /dev access.
-func BuildVNodeDeployment(opts BuilderOptions) *appsv1.Deployment {
-	depName := opts.Name + "-vnode"
-	// Intentionally do NOT copy the base labels — the main Service and the
-	// headless Service select on `app: vibecluster`, so carrying that label
-	// here would make the API server Service load-balance between the k3s
-	// server pod and the vnode pod (which doesn't listen on 6443).
-	depLabels := map[string]string{
+// VNodeName returns the base name for the vnode StatefulSet and its
+// backing headless Service.
+func VNodeName(name string) string {
+	return name + "-vnode"
+}
+
+// vnodeLabels returns the pod/selector labels for vnode resources. Base
+// vcluster labels are intentionally NOT copied — the main Service and the
+// headless Service select on `app: vibecluster`, so carrying that label
+// on the vnode pods would make the API server Service load-balance
+// between the k3s server and agents (which don't listen on 6443).
+func vnodeLabels(name string) map[string]string {
+	return map[string]string{
 		LabelManagedBy:              LabelManagedByValue,
-		LabelVClusterName:           opts.Name,
+		LabelVClusterName:           name,
 		"vibecluster.dev/component": "vnode",
 	}
+}
+
+// BuildVNodeHeadlessService returns the headless Service backing the vnode
+// StatefulSet. StatefulSet.spec.serviceName is required; we use a dedicated
+// service here instead of the main `-headless` one so only vnode pod DNS
+// records land in it.
+func BuildVNodeHeadlessService(opts BuilderOptions) *corev1.Service {
+	labels := vnodeLabels(opts.Name)
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      VNodeName(opts.Name),
+			Namespace: opts.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:      corev1.ServiceTypeClusterIP,
+			ClusterIP: "None",
+			Selector:  labels,
+			// A dummy port keeps the Service valid across older kube
+			// versions that reject zero-port headless Services.
+			Ports: []corev1.ServicePort{
+				{Name: "kubelet", Port: 10250, Protocol: corev1.ProtocolTCP},
+			},
+			// We want stable DNS for pod-N before the agent is Ready.
+			PublishNotReadyAddresses: true,
+		},
+	}
+}
+
+// BuildVNodeStatefulSet returns the privileged k3s-agent StatefulSet that
+// forms the virtual worker nodes for a vnode-mode cluster. Replica count
+// comes from opts.VNodeReplicas(); each replica registers as a distinct
+// node via its ordinal pod name (`<vc>-vnode-0`, `-1`, ...). Agents join
+// the virtual k3s server via the in-cluster Service DNS name using the
+// deterministic per-vcluster token, so a stable-name pod that restarts
+// re-registers against the same k3s node object.
+//
+// These pods need privileged: true on a stock host cluster: the embedded
+// kubelet mounts cgroups, the CNI (flannel) manipulates iptables/netlink,
+// and containerd-in-containerd needs /dev access.
+func BuildVNodeStatefulSet(opts BuilderOptions) *appsv1.StatefulSet {
+	stsName := VNodeName(opts.Name)
+	labels := vnodeLabels(opts.Name)
 
 	serverURL := fmt.Sprintf("https://%s.%s.svc.cluster.local:%d", opts.Name, opts.Namespace, ServicePort)
 
-	dep := &appsv1.Deployment{
+	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      depName,
+			Name:      stsName,
 			Namespace: opts.Namespace,
-			Labels:    depLabels,
+			Labels:    labels,
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To[int32](1),
-			Selector: &metav1.LabelSelector{MatchLabels: depLabels},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:    ptr.To(opts.VNodeReplicas()),
+			ServiceName: stsName,
+			// Parallel so multiple agents come up concurrently rather
+			// than serializing through the (expensive) privileged k3s
+			// boot one-at-a-time.
+			PodManagementPolicy: appsv1.ParallelPodManagement,
+			Selector:            &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: depLabels},
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
 					ServiceAccountName:            "vc-" + opts.Name,
 					TerminationGracePeriodSeconds: ptr.To[int64](10),
@@ -757,10 +815,10 @@ func BuildVNodeDeployment(opts BuilderOptions) *appsv1.Deployment {
 	}
 
 	if opts.ImagePullSecret != "" {
-		dep.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
+		sts.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
 			{Name: opts.ImagePullSecret},
 		}
 	}
 
-	return dep
+	return sts
 }
