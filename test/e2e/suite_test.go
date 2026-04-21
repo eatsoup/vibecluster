@@ -131,6 +131,7 @@ func createSharedVCluster() error {
 }
 
 func teardown() {
+	helpers.TeardownSharedVCluster()
 	if helpers.SharedVCName != "" {
 		cmd := exec.Command(helpers.VibeclusterBin, "delete", helpers.SharedVCName)
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+helpers.HostKubeconfig)

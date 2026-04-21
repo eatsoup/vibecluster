@@ -9,6 +9,7 @@ bin/
 # Environment / secrets
 .env
 .env.*
+*.kubeconfig
 
 # Go
 vendor/

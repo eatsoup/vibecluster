@@ -21,13 +21,26 @@ import (
 
 // Globals set by TestMain before any test runs.
 var (
-	VibeclusterBin    string // path to the vibecluster binary
-	HostKubeconfig    string // kubeconfig for the k3d host cluster
-	SyncerImage       string // syncer image to use when creating vclusters
-	OperatorImage     string // operator image to use when installing the operator
-	SharedVCName      string // name of the shared vcluster created in TestMain
+	VibeclusterBin     string // path to the vibecluster binary
+	HostKubeconfig     string // kubeconfig for the k3d host cluster
+	SyncerImage        string // syncer image to use when creating vclusters
+	OperatorImage      string // operator image to use when installing the operator
+	SharedVCName       string // name of the shared vcluster created in TestMain
 	SharedVCKubeconfig string // kubeconfig path for the shared vcluster
+
+	sharedPFCancel context.CancelFunc // cancels the shared vcluster port-forward; called by TeardownSharedVCluster
 )
+
+// TeardownSharedVCluster stops the background port-forward started by
+// SetupSharedVCluster. Must be called before the test process exits;
+// otherwise the orphaned kubectl subprocess keeps the parent's stderr
+// pipe open and hangs `go test` at shutdown.
+func TeardownSharedVCluster() {
+	if sharedPFCancel != nil {
+		sharedPFCancel()
+		sharedPFCancel = nil
+	}
+}
 
 // UniqueName returns a short unique name safe for use as a Kubernetes resource name.
 func UniqueName(prefix string) string {
@@ -181,8 +194,10 @@ func StartPortForward(t *testing.T, ns, pod string, remotePort int) (int, func()
 		"pod/"+pod,
 		fmt.Sprintf("%d:%d", localPort, remotePort),
 	)
-	cmd.Stdout = os.Stderr // route pf logs to stderr so -v shows them
-	cmd.Stderr = os.Stderr
+	// Route to /dev/null. Wiring these to os.Stderr causes kubectl to hold
+	// the test binary's stderr pipe open, hanging `go test` at shutdown.
+	cmd.Stdout = nil
+	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
 		cancel()
 		t.Fatalf("starting port-forward %s/%s:%d: %v", ns, pod, remotePort, err)
@@ -285,8 +300,11 @@ func SetupSharedVCluster(name string) (string, error) {
 	pfCmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", HostKubeconfig,
 		"port-forward", "-n", ns, "pod/"+pod,
 		fmt.Sprintf("%d:6443", localPort))
-	pfCmd.Stdout = os.Stderr
-	pfCmd.Stderr = os.Stderr
+	// Route to /dev/null (nil means os.DevNull in exec.Cmd). Wiring these to
+	// os.Stderr causes the orphaned subprocess to keep the test binary's
+	// stderr pipe open, which hangs `go test` for 30s (WaitDelay) or longer.
+	pfCmd.Stdout = nil
+	pfCmd.Stderr = nil
 	if err := pfCmd.Start(); err != nil {
 		cancel()
 		return "", fmt.Errorf("starting port-forward: %w", err)
@@ -307,19 +325,19 @@ func SetupSharedVCluster(name string) (string, error) {
 	caData, err := execInPodRaw(ns, pod, "k3s", "cat", "/data/k3s/server/tls/server-ca.crt")
 	if err != nil {
 		cancel()
-		pfCmd.Wait()
+		pfCmd.Wait() //nolint:errcheck
 		return "", fmt.Errorf("reading CA: %w", err)
 	}
 	clientCert, err := execInPodRaw(ns, pod, "k3s", "cat", "/data/k3s/server/tls/client-admin.crt")
 	if err != nil {
 		cancel()
-		pfCmd.Wait()
+		pfCmd.Wait() //nolint:errcheck
 		return "", fmt.Errorf("reading client cert: %w", err)
 	}
 	clientKey, err := execInPodRaw(ns, pod, "k3s", "cat", "/data/k3s/server/tls/client-admin.key")
 	if err != nil {
 		cancel()
-		pfCmd.Wait()
+		pfCmd.Wait() //nolint:errcheck
 		return "", fmt.Errorf("reading client key: %w", err)
 	}
 
@@ -339,7 +357,7 @@ func SetupSharedVCluster(name string) (string, error) {
 	_ = caData // CA not used; insecure-skip-tls-verify instead
 	if err := clientcmd.WriteToFile(*cfg, kcPath); err != nil {
 		cancel()
-		pfCmd.Wait()
+		pfCmd.Wait() //nolint:errcheck
 		return "", fmt.Errorf("writing kubeconfig: %w", err)
 	}
 
@@ -347,18 +365,18 @@ func SetupSharedVCluster(name string) (string, error) {
 	for i := 0; i < 20; i++ {
 		cmd := exec.Command("kubectl", "--kubeconfig", kcPath, "get", "nodes")
 		if err := cmd.Run(); err == nil {
-			// Keep port-forward running in background (lives until process exits).
+			// Keep port-forward running; TeardownSharedVCluster will cancel it.
 			go func() {
 				pfCmd.Wait() //nolint:errcheck
 			}()
-			_ = cancel // intentionally leaked; lives for the test process lifetime
+			sharedPFCancel = cancel
 			return kcPath, nil
 		}
 		time.Sleep(3 * time.Second)
 	}
 
 	cancel()
-	pfCmd.Wait()
+	pfCmd.Wait() //nolint:errcheck
 	return "", fmt.Errorf("shared vcluster API not reachable after 60s")
 }
 
