@@ -42,6 +42,15 @@ func TeardownSharedVCluster() {
 	}
 }
 
+// progress writes a timestamped progress line straight to stderr, bypassing
+// go test's per-test output buffering so CI shows live progress during long
+// waits. Safe to call concurrently from parallel tests.
+func progress(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[e2e %s] %s\n",
+		time.Now().UTC().Format("15:04:05"),
+		fmt.Sprintf(format, args...))
+}
+
 // UniqueName returns a short unique name safe for use as a Kubernetes resource name.
 func UniqueName(prefix string) string {
 	return fmt.Sprintf("%s-%05d", prefix, rand.Intn(100000))
@@ -120,14 +129,22 @@ func MustKubectlExec(t *testing.T, kubeconfig, ns, pod, container string, cmd ..
 }
 
 // WaitFor polls condition until it returns nil or timeout is exceeded.
+// Emits a stderr heartbeat every ~30s so parallel tests show life in CI.
 func WaitFor(t *testing.T, timeout, interval time.Duration, condition func() error) error {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
+	deadline := start.Add(timeout)
+	nextHeartbeat := start.Add(30 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		lastErr = condition()
 		if lastErr == nil {
 			return nil
+		}
+		if time.Now().After(nextHeartbeat) {
+			progress("%s: still waiting (%s / %s): %v",
+				t.Name(), time.Since(start).Round(time.Second), timeout, lastErr)
+			nextHeartbeat = time.Now().Add(30 * time.Second)
 		}
 		time.Sleep(interval)
 	}
@@ -147,6 +164,8 @@ func MustWaitFor(t *testing.T, timeout, interval time.Duration, condition func()
 // is in the Running phase.
 func WaitForPodRunning(t *testing.T, kubeconfig, ns, labelSelector string, timeout time.Duration) {
 	t.Helper()
+	progress("%s: waiting for pod running ns=%s selector=%s", t.Name(), ns, labelSelector)
+	start := time.Now()
 	MustWaitFor(t, timeout, 5*time.Second, func() error {
 		out, err := Kubectl(t, kubeconfig, "get", "pods", "-n", ns,
 			"-l", labelSelector, "-o", "jsonpath={.items[*].status.phase}")
@@ -160,11 +179,14 @@ func WaitForPodRunning(t *testing.T, kubeconfig, ns, labelSelector string, timeo
 		}
 		return fmt.Errorf("no Running pods in %s matching %s (got %q)", ns, labelSelector, out)
 	})
+	progress("%s: pod running ns=%s selector=%s after %s", t.Name(), ns, labelSelector, time.Since(start).Round(time.Second))
 }
 
 // WaitForStatefulSetReady waits until all replicas of the StatefulSet are ready.
 func WaitForStatefulSetReady(t *testing.T, kubeconfig, ns, name string, timeout time.Duration) {
 	t.Helper()
+	progress("%s: waiting for statefulset ready ns=%s name=%s", t.Name(), ns, name)
+	start := time.Now()
 	MustWaitFor(t, timeout, 5*time.Second, func() error {
 		out, err := Kubectl(t, kubeconfig, "get", "statefulset", name, "-n", ns,
 			"-o", "jsonpath={.status.readyReplicas}")
@@ -176,6 +198,7 @@ func WaitForStatefulSetReady(t *testing.T, kubeconfig, ns, name string, timeout 
 		}
 		return nil
 	})
+	progress("%s: statefulset ready ns=%s name=%s after %s", t.Name(), ns, name, time.Since(start).Round(time.Second))
 }
 
 // StartPortForward starts a kubectl port-forward from a random local port to
@@ -274,13 +297,22 @@ func SetupSharedVCluster(name string) (string, error) {
 	pod := name + "-0"
 
 	// Wait up to 5 min for the pod to be Running.
+	progress("shared setup: waiting for pod %s/%s Running", ns, pod)
+	start := time.Now()
+	attempts := 0
 	deadline := time.Now().Add(5 * time.Minute)
 	for time.Now().Before(deadline) {
+		attempts++
 		cmd := exec.Command("kubectl", "--kubeconfig", HostKubeconfig,
 			"get", "pod", pod, "-n", ns, "-o", "jsonpath={.status.phase}")
 		out, err := cmd.Output()
-		if err == nil && strings.TrimSpace(string(out)) == "Running" {
+		phase := strings.TrimSpace(string(out))
+		if err == nil && phase == "Running" {
+			progress("shared setup: pod %s/%s Running after %s", ns, pod, time.Since(start).Round(time.Second))
 			break
+		}
+		if attempts%6 == 0 {
+			progress("shared setup: pod %s/%s phase=%q elapsed=%s", ns, pod, phase, time.Since(start).Round(time.Second))
 		}
 		time.Sleep(5 * time.Second)
 		if !time.Now().Before(deadline) {
@@ -362,9 +394,11 @@ func SetupSharedVCluster(name string) (string, error) {
 	}
 
 	// Smoke-test connectivity.
+	progress("shared setup: smoke-testing API via port-forward on :%d", localPort)
 	for i := 0; i < 20; i++ {
 		cmd := exec.Command("kubectl", "--kubeconfig", kcPath, "get", "nodes")
 		if err := cmd.Run(); err == nil {
+			progress("shared setup: API reachable after %d attempts", i+1)
 			// Keep port-forward running; TeardownSharedVCluster will cancel it.
 			go func() {
 				pfCmd.Wait() //nolint:errcheck
