@@ -1,0 +1,535 @@
+// Package helpers provides shared utilities for the vibecluster e2e test suite.
+package helpers
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"math/rand"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+)
+
+// Globals set by TestMain before any test runs.
+var (
+	VibeclusterBin     string // path to the vibecluster binary
+	HostKubeconfig     string // kubeconfig for the k3d host cluster
+	SyncerImage        string // syncer image to use when creating vclusters
+	OperatorImage      string // operator image to use when installing the operator
+	SharedVCName       string // name of the shared vcluster created in TestMain
+	SharedVCKubeconfig string // kubeconfig path for the shared vcluster
+
+	sharedPFCancel context.CancelFunc // cancels the shared vcluster port-forward; called by TeardownSharedVCluster
+)
+
+// TeardownSharedVCluster stops the background port-forward started by
+// SetupSharedVCluster. Must be called before the test process exits;
+// otherwise the orphaned kubectl subprocess keeps the parent's stderr
+// pipe open and hangs `go test` at shutdown.
+func TeardownSharedVCluster() {
+	if sharedPFCancel != nil {
+		sharedPFCancel()
+		sharedPFCancel = nil
+	}
+}
+
+// progress writes a timestamped progress line straight to stderr, bypassing
+// go test's per-test output buffering so CI shows live progress during long
+// waits. Safe to call concurrently from parallel tests.
+func progress(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[e2e %s] %s\n",
+		time.Now().UTC().Format("15:04:05"),
+		fmt.Sprintf(format, args...))
+}
+
+// UniqueName returns a short unique name safe for use as a Kubernetes resource name.
+func UniqueName(prefix string) string {
+	return fmt.Sprintf("%s-%05d", prefix, rand.Intn(100000))
+}
+
+// RunVibeCluster executes the vibecluster CLI with the given arguments against
+// the host cluster and returns stdout. On error it returns the combined output
+// so callers can inspect it.
+func RunVibeCluster(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(VibeclusterBin, args...)
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+HostKubeconfig)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	combined := stdout.String() + stderr.String()
+	if err != nil {
+		return combined, fmt.Errorf("vibecluster %s: %w\n%s", strings.Join(args, " "), err, combined)
+	}
+	return combined, nil
+}
+
+// MustVibeCluster is like RunVibeCluster but calls t.Fatal on error.
+func MustVibeCluster(t *testing.T, args ...string) string {
+	t.Helper()
+	out, err := RunVibeCluster(t, args...)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return out
+}
+
+// Kubectl runs kubectl with the given kubeconfig and returns stdout.
+func Kubectl(t *testing.T, kubeconfig string, args ...string) (string, error) {
+	t.Helper()
+	fullArgs := append([]string{"--kubeconfig", kubeconfig}, args...)
+	cmd := exec.Command("kubectl", fullArgs...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("kubectl %s: %w\nstdout: %s\nstderr: %s",
+			strings.Join(args, " "), err, stdout.String(), stderr.String())
+	}
+	return stdout.String(), nil
+}
+
+// MustKubectl is like Kubectl but calls t.Fatal on error.
+func MustKubectl(t *testing.T, kubeconfig string, args ...string) string {
+	t.Helper()
+	out, err := Kubectl(t, kubeconfig, args...)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return out
+}
+
+// KubectlExec runs a command inside a pod container and returns stdout.
+func KubectlExec(t *testing.T, kubeconfig, ns, pod, container string, cmd ...string) (string, error) {
+	t.Helper()
+	args := []string{"exec", pod, "-n", ns, "-c", container, "--"}
+	args = append(args, cmd...)
+	return Kubectl(t, kubeconfig, args...)
+}
+
+// MustKubectlExec is like KubectlExec but calls t.Fatal on error.
+func MustKubectlExec(t *testing.T, kubeconfig, ns, pod, container string, cmd ...string) string {
+	t.Helper()
+	out, err := KubectlExec(t, kubeconfig, ns, pod, container, cmd...)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return out
+}
+
+// WaitFor polls condition until it returns nil or timeout is exceeded.
+// Emits a stderr heartbeat every ~30s so parallel tests show life in CI.
+func WaitFor(t *testing.T, timeout, interval time.Duration, condition func() error) error {
+	t.Helper()
+	start := time.Now()
+	deadline := start.Add(timeout)
+	nextHeartbeat := start.Add(30 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastErr = condition()
+		if lastErr == nil {
+			return nil
+		}
+		if time.Now().After(nextHeartbeat) {
+			progress("%s: still waiting (%s / %s): %v",
+				t.Name(), time.Since(start).Round(time.Second), timeout, lastErr)
+			nextHeartbeat = time.Now().Add(30 * time.Second)
+		}
+		time.Sleep(interval)
+	}
+	return fmt.Errorf("timed out after %s: %v", timeout, lastErr)
+}
+
+// MustWaitFor is like WaitFor but calls t.Fatal on timeout.
+func MustWaitFor(t *testing.T, timeout, interval time.Duration, condition func() error) {
+	t.Helper()
+	if err := WaitFor(t, timeout, interval, condition); err != nil {
+		DumpDebugAll(t)
+		t.Fatalf("WaitFor: %v", err)
+	}
+}
+
+// WaitForPodRunning waits until at least one pod matching labelSelector in ns
+// is in the Running phase.
+func WaitForPodRunning(t *testing.T, kubeconfig, ns, labelSelector string, timeout time.Duration) {
+	t.Helper()
+	progress("%s: waiting for pod running ns=%s selector=%s", t.Name(), ns, labelSelector)
+	start := time.Now()
+	MustWaitFor(t, timeout, 5*time.Second, func() error {
+		out, err := Kubectl(t, kubeconfig, "get", "pods", "-n", ns,
+			"-l", labelSelector, "-o", "jsonpath={.items[*].status.phase}")
+		if err != nil {
+			return err
+		}
+		for _, phase := range strings.Fields(out) {
+			if phase == "Running" {
+				return nil
+			}
+		}
+		return fmt.Errorf("no Running pods in %s matching %s (got %q)", ns, labelSelector, out)
+	})
+	progress("%s: pod running ns=%s selector=%s after %s", t.Name(), ns, labelSelector, time.Since(start).Round(time.Second))
+}
+
+// WaitForStatefulSetReady waits until all replicas of the StatefulSet are ready.
+func WaitForStatefulSetReady(t *testing.T, kubeconfig, ns, name string, timeout time.Duration) {
+	t.Helper()
+	progress("%s: waiting for statefulset ready ns=%s name=%s", t.Name(), ns, name)
+	start := time.Now()
+	MustWaitFor(t, timeout, 5*time.Second, func() error {
+		out, err := Kubectl(t, kubeconfig, "get", "statefulset", name, "-n", ns,
+			"-o", "jsonpath={.status.readyReplicas}")
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(out) == "0" || strings.TrimSpace(out) == "" {
+			return fmt.Errorf("statefulset %s/%s not ready yet", ns, name)
+		}
+		return nil
+	})
+	progress("%s: statefulset ready ns=%s name=%s after %s", t.Name(), ns, name, time.Since(start).Round(time.Second))
+}
+
+// StartPortForward starts a kubectl port-forward from a random local port to
+// remotePort on the given pod, and returns the local port plus a stop function.
+// The port-forward is automatically stopped when t completes.
+func StartPortForward(t *testing.T, ns, pod string, remotePort int) (int, func()) {
+	t.Helper()
+
+	localPort := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cmd := exec.CommandContext(ctx, "kubectl",
+		"--kubeconfig", HostKubeconfig,
+		"port-forward",
+		"-n", ns,
+		"pod/"+pod,
+		fmt.Sprintf("%d:%d", localPort, remotePort),
+	)
+	// Route to /dev/null. Wiring these to os.Stderr causes kubectl to hold
+	// the test binary's stderr pipe open, hanging `go test` at shutdown.
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("starting port-forward %s/%s:%d: %v", ns, pod, remotePort, err)
+	}
+
+	// Wait for the local port to accept connections (up to 30 s).
+	addr := fmt.Sprintf("127.0.0.1:%d", localPort)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			conn, err := net.DialTimeout("tcp", addr, time.Second)
+			if err == nil {
+				conn.Close()
+				return
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
+	wg.Wait()
+
+	stop := func() {
+		cancel()
+		cmd.Wait() //nolint:errcheck
+	}
+	t.Cleanup(stop)
+	return localPort, stop
+}
+
+// GetVClusterKubeconfig sets up a port-forward to the named virtual cluster's
+// k3s API server, extracts TLS credentials, and returns the path to a
+// kubeconfig file valid for the duration of the test.
+//
+// It assumes the StatefulSet pod NAME-0 is already Running in namespace vc-NAME.
+func GetVClusterKubeconfig(t *testing.T, name string) string {
+	t.Helper()
+	ns := "vc-" + name
+	pod := name + "-0"
+
+	// Ensure the pod is Running first.
+	WaitForStatefulSetReady(t, HostKubeconfig, ns, name, 5*time.Minute)
+
+	// Port-forward to the k3s API server port inside the pod.
+	localPort, _ := StartPortForward(t, ns, pod, 6443)
+
+	// Extract TLS credentials via exec.
+	caData := []byte(strings.TrimSpace(MustKubectlExec(t, HostKubeconfig, ns, pod, "k3s",
+		"cat", "/data/k3s/server/tls/server-ca.crt")))
+	clientCert := []byte(strings.TrimSpace(MustKubectlExec(t, HostKubeconfig, ns, pod, "k3s",
+		"cat", "/data/k3s/server/tls/client-admin.crt")))
+	clientKey := []byte(strings.TrimSpace(MustKubectlExec(t, HostKubeconfig, ns, pod, "k3s",
+		"cat", "/data/k3s/server/tls/client-admin.key")))
+
+	server := fmt.Sprintf("https://127.0.0.1:%d", localPort)
+	kcPath := filepath.Join(t.TempDir(), name+".kubeconfig")
+	writeKubeconfig(t, kcPath, name, server, caData, clientCert, clientKey)
+
+	// Smoke-test: wait until the virtual API is reachable.
+	MustWaitFor(t, 60*time.Second, 3*time.Second, func() error {
+		_, err := Kubectl(t, kcPath, "get", "nodes")
+		return err
+	})
+
+	return kcPath
+}
+
+// SetupSharedVCluster creates a vcluster and returns the kubeconfig path.
+// It is intended for use in TestMain where no *testing.T is available.
+// Errors are returned rather than calling t.Fatal.
+func SetupSharedVCluster(name string) (string, error) {
+	ns := "vc-" + name
+	pod := name + "-0"
+
+	// Wait up to 5 min for the pod to be Running.
+	progress("shared setup: waiting for pod %s/%s Running", ns, pod)
+	start := time.Now()
+	attempts := 0
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		attempts++
+		cmd := exec.Command("kubectl", "--kubeconfig", HostKubeconfig,
+			"get", "pod", pod, "-n", ns, "-o", "jsonpath={.status.phase}")
+		out, err := cmd.Output()
+		phase := strings.TrimSpace(string(out))
+		if err == nil && phase == "Running" {
+			progress("shared setup: pod %s/%s Running after %s", ns, pod, time.Since(start).Round(time.Second))
+			break
+		}
+		if attempts%6 == 0 {
+			progress("shared setup: pod %s/%s phase=%q elapsed=%s", ns, pod, phase, time.Since(start).Round(time.Second))
+		}
+		time.Sleep(5 * time.Second)
+		if !time.Now().Before(deadline) {
+			return "", fmt.Errorf("pod %s/%s did not reach Running within 5m", ns, pod)
+		}
+	}
+
+	// Find a free port and start port-forward.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", fmt.Errorf("finding free port: %w", err)
+	}
+	localPort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pfCmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", HostKubeconfig,
+		"port-forward", "-n", ns, "pod/"+pod,
+		fmt.Sprintf("%d:6443", localPort))
+	// Route to /dev/null (nil means os.DevNull in exec.Cmd). Wiring these to
+	// os.Stderr causes the orphaned subprocess to keep the test binary's
+	// stderr pipe open, which hangs `go test` for 30s (WaitDelay) or longer.
+	pfCmd.Stdout = nil
+	pfCmd.Stderr = nil
+	if err := pfCmd.Start(); err != nil {
+		cancel()
+		return "", fmt.Errorf("starting port-forward: %w", err)
+	}
+
+	// Wait for port to accept connections.
+	addr := fmt.Sprintf("127.0.0.1:%d", localPort)
+	for i := 0; i < 30; i++ {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Extract TLS credentials.
+	caData, err := execInPodRaw(ns, pod, "k3s", "cat", "/data/k3s/server/tls/server-ca.crt")
+	if err != nil {
+		cancel()
+		pfCmd.Wait() //nolint:errcheck
+		return "", fmt.Errorf("reading CA: %w", err)
+	}
+	clientCert, err := execInPodRaw(ns, pod, "k3s", "cat", "/data/k3s/server/tls/client-admin.crt")
+	if err != nil {
+		cancel()
+		pfCmd.Wait() //nolint:errcheck
+		return "", fmt.Errorf("reading client cert: %w", err)
+	}
+	clientKey, err := execInPodRaw(ns, pod, "k3s", "cat", "/data/k3s/server/tls/client-admin.key")
+	if err != nil {
+		cancel()
+		pfCmd.Wait() //nolint:errcheck
+		return "", fmt.Errorf("reading client key: %w", err)
+	}
+
+	kcPath := filepath.Join(os.TempDir(), "vibecluster-e2e-shared.kubeconfig")
+	cfg := &clientcmdapi.Config{
+		Clusters: map[string]*clientcmdapi.Cluster{
+			"vibe-" + name: {Server: fmt.Sprintf("https://127.0.0.1:%d", localPort), InsecureSkipTLSVerify: true},
+		},
+		AuthInfos: map[string]*clientcmdapi.AuthInfo{
+			"vibe-" + name: {ClientCertificateData: []byte(strings.TrimSpace(string(clientCert))), ClientKeyData: []byte(strings.TrimSpace(string(clientKey)))},
+		},
+		Contexts: map[string]*clientcmdapi.Context{
+			"vibe-" + name: {Cluster: "vibe-" + name, AuthInfo: "vibe-" + name},
+		},
+		CurrentContext: "vibe-" + name,
+	}
+	_ = caData // CA not used; insecure-skip-tls-verify instead
+	if err := clientcmd.WriteToFile(*cfg, kcPath); err != nil {
+		cancel()
+		pfCmd.Wait() //nolint:errcheck
+		return "", fmt.Errorf("writing kubeconfig: %w", err)
+	}
+
+	// Smoke-test connectivity.
+	progress("shared setup: smoke-testing API via port-forward on :%d", localPort)
+	for i := 0; i < 20; i++ {
+		cmd := exec.Command("kubectl", "--kubeconfig", kcPath, "get", "nodes")
+		if err := cmd.Run(); err == nil {
+			progress("shared setup: API reachable after %d attempts", i+1)
+			// Keep port-forward running; TeardownSharedVCluster will cancel it.
+			go func() {
+				pfCmd.Wait() //nolint:errcheck
+			}()
+			sharedPFCancel = cancel
+			return kcPath, nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	cancel()
+	pfCmd.Wait() //nolint:errcheck
+	return "", fmt.Errorf("shared vcluster API not reachable after 60s")
+}
+
+func execInPodRaw(ns, pod, container string, cmd ...string) ([]byte, error) {
+	args := append([]string{"--kubeconfig", HostKubeconfig,
+		"exec", pod, "-n", ns, "-c", container, "--"}, cmd...)
+	return exec.Command("kubectl", args...).Output()
+}
+
+// writeKubeconfig writes a kubeconfig that uses insecure-skip-tls-verify so
+// port-forwarded connections (where 127.0.0.1 is not in the k3s cert SAN) work.
+func writeKubeconfig(t *testing.T, path, name, server string, _, clientCert, clientKey []byte) {
+	t.Helper()
+	clusterKey := "vibe-" + name
+	cfg := &clientcmdapi.Config{
+		Clusters: map[string]*clientcmdapi.Cluster{
+			clusterKey: {
+				Server:                server,
+				InsecureSkipTLSVerify: true,
+			},
+		},
+		AuthInfos: map[string]*clientcmdapi.AuthInfo{
+			clusterKey: {
+				ClientCertificateData: clientCert,
+				ClientKeyData:         clientKey,
+			},
+		},
+		Contexts: map[string]*clientcmdapi.Context{
+			clusterKey: {Cluster: clusterKey, AuthInfo: clusterKey},
+		},
+		CurrentContext: clusterKey,
+	}
+	if err := clientcmd.WriteToFile(*cfg, path); err != nil {
+		t.Fatalf("writing vcluster kubeconfig: %v", err)
+	}
+}
+
+// CreateVCluster creates a virtual cluster, registers cleanup via t.Cleanup,
+// and returns the path to a kubeconfig that can reach its API server.
+//
+// extraArgs are appended to `vibecluster create NAME --mode=legacy --connect=false`.
+func CreateVCluster(t *testing.T, name string, extraArgs ...string) string {
+	t.Helper()
+	args := append([]string{"create", name, "--mode=legacy", "--connect=false"}, extraArgs...)
+	if SyncerImage != "" {
+		args = append(args, "--syncer-image", SyncerImage)
+	}
+	MustVibeCluster(t, args...)
+
+	t.Cleanup(func() {
+		// Best-effort cleanup; ignore errors (test may have already deleted it).
+		RunVibeCluster(t, "delete", name) //nolint:errcheck
+	})
+
+	return GetVClusterKubeconfig(t, name)
+}
+
+// DumpDebug logs kubectl output for the vc-NAME namespace on test failure.
+func DumpDebug(t *testing.T, ns string) {
+	t.Helper()
+	if !t.Failed() {
+		return
+	}
+	for _, args := range [][]string{
+		{"get", "all", "-n", ns},
+		{"describe", "pods", "-n", ns},
+		{"get", "events", "-n", ns, "--sort-by=.lastTimestamp"},
+	} {
+		out, err := Kubectl(t, HostKubeconfig, args...)
+		if err == nil {
+			t.Logf("=== kubectl %s ===\n%s", strings.Join(args, " "), out)
+		}
+	}
+}
+
+// DumpDebugAll logs kubectl output across all vc-* namespaces on test failure.
+func DumpDebugAll(t *testing.T) {
+	t.Helper()
+	if !t.Failed() {
+		return
+	}
+	out, err := Kubectl(t, HostKubeconfig, "get", "namespaces", "-o",
+		"jsonpath={.items[*].metadata.name}")
+	if err != nil {
+		return
+	}
+	for _, ns := range strings.Fields(out) {
+		if strings.HasPrefix(ns, "vc-") {
+			DumpDebug(t, ns)
+		}
+	}
+}
+
+// MustKubectlApply applies a YAML manifest string using kubectl apply -f -.
+func MustKubectlApply(t *testing.T, kubeconfig, yaml string) {
+	t.Helper()
+	cmd := exec.Command("kubectl", "--kubeconfig", kubeconfig, "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(yaml)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("kubectl apply: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+}
+
+// ErrNotFound returns a formatted error indicating something was not found in output.
+func ErrNotFound(needle, haystack string) error {
+	return fmt.Errorf("%q not found in output:\n%s", needle, haystack)
+}
+
+// freePort asks the OS for an available TCP port.
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("finding free port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	return port
+}
