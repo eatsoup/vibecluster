@@ -54,8 +54,13 @@ func ensureOperator(t *testing.T) {
 
 // TestOperatorInstall verifies that `vibecluster operator install` creates the
 // operator Deployment in the vibecluster-system namespace and that it becomes Ready.
+//
+// Operator tests are NOT t.Parallel — they must run sequentially in source order
+// so that TestOperatorUninstall (which tears down the operator) runs last.
+// Running them in parallel causes ensureOperator's sync.Once to fire during
+// Uninstall (which is serial and therefore runs before any t.Parallel resumes),
+// leaving the install/CR tests to skip.
 func TestOperatorInstall(t *testing.T) {
-	t.Parallel()
 	ensureOperator(t)
 
 	// Deployment must exist and be ready (ensureOperator already waits, but
@@ -78,7 +83,6 @@ func TestOperatorInstall(t *testing.T) {
 // TestOperatorCRCreate applies a VirtualCluster CR and verifies the operator
 // reconciles it to phase=Running with a backing host namespace.
 func TestOperatorCRCreate(t *testing.T) {
-	t.Parallel()
 	ensureOperator(t)
 
 	name := helpers.UniqueName("op")
@@ -143,7 +147,6 @@ spec:
 // TestOperatorCRDelete verifies that deleting a VirtualCluster CR causes the
 // operator to clean up the host namespace.
 func TestOperatorCRDelete(t *testing.T) {
-	t.Parallel()
 	ensureOperator(t)
 
 	name := helpers.UniqueName("opd")
@@ -191,12 +194,9 @@ spec:
 
 // TestOperatorUninstall verifies that `vibecluster operator uninstall` removes
 // the controller Deployment and CRD, while leaving any existing vclusters intact.
+// Must run last in source order — relies on the operator still being installed
+// from the preceding tests.
 func TestOperatorUninstall(t *testing.T) {
-	// Intentionally NOT parallel — uninstalling the operator would race with
-	// TestOperatorCRCreate / TestOperatorCRDelete if they ran concurrently.
-	// This test must run last among operator tests because it removes the operator.
-	// Any clusters created before this point (and still running) should survive.
-
 	ensureOperator(t)
 
 	// Create a legacy cluster that should survive the uninstall.

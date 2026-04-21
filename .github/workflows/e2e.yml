@@ -39,8 +39,15 @@ jobs:
           VIBC_BIN: ${{ github.workspace }}/bin/vibecluster
           VIBC_SYNCER_IMAGE: ghcr.io/eatsoup/vibecluster/syncer:e2e
           VIBC_OPERATOR_IMAGE: ghcr.io/eatsoup/vibecluster/operator:e2e
+        # - pipefail: `| tee` would otherwise mask `go test`'s exit code
+        # - stdbuf -oL -eL on both ends: tee block-buffers its stdout (a pipe
+        #   to the runner) by default, so progress lines wouldn't surface
+        #   until the step exited. Line-buffer end-to-end for live logs.
+        shell: bash
         run: |
-          go test -v -tags e2e -timeout 45m ./test/e2e/... 2>&1 | tee e2e.log
+          set -euo pipefail
+          stdbuf -oL -eL go test -v -tags e2e -timeout 45m ./test/e2e/... 2>&1 \
+            | stdbuf -oL tee e2e.log
 
       - name: Upload e2e log on failure
         if: failure()
