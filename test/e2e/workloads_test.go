@@ -65,7 +65,7 @@ func TestPodToPodCommunication(t *testing.T) {
 	t.Cleanup(func() {
 		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "deployment", svcName, "--ignore-not-found")   //nolint:errcheck
 		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "svc", svcName, "--ignore-not-found")         //nolint:errcheck
-		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", clientName, "--ignore-not-found")       //nolint:errcheck
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", clientName, "--ignore-not-found", "--wait=false") //nolint:errcheck
 	})
 
 	helpers.WaitForPodRunning(t, helpers.SharedVCKubeconfig, "default", "app="+svcName, 5*time.Minute)
@@ -110,7 +110,7 @@ func TestDNSResolution(t *testing.T) {
 	t.Cleanup(func() {
 		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "deployment", webName, "--ignore-not-found") //nolint:errcheck
 		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "svc", webName, "--ignore-not-found")       //nolint:errcheck
-		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", resolverName, "--ignore-not-found")  //nolint:errcheck
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", resolverName, "--ignore-not-found", "--wait=false") //nolint:errcheck
 	})
 
 	helpers.WaitForPodRunning(t, helpers.SharedVCKubeconfig, "default", "app="+webName, 5*time.Minute)
@@ -133,7 +133,9 @@ func TestDNSResolution(t *testing.T) {
 }
 
 // TestConfigMapMount creates a ConfigMap and Pod in the shared vcluster that
-// reads it via an environment variable.
+// mounts the ConfigMap as a file. Exercises the syncer's ConfigMap name
+// translation on pod volumes (pkg/syncer/syncer.go rewrites vol.ConfigMap.Name
+// when mirroring virtual pods into the host namespace).
 func TestConfigMapMount(t *testing.T) {
 	t.Parallel()
 	defer helpers.DumpDebug(t, "vc-"+helpers.SharedVCName)
@@ -142,10 +144,10 @@ func TestConfigMapMount(t *testing.T) {
 	podName := helpers.UniqueName("reader")
 
 	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
-		"create", "configmap", cmName, "--from-literal=MESSAGE=hello-"+cmName)
+		"create", "configmap", cmName, "--from-literal=message=hello-"+cmName)
 	t.Cleanup(func() {
 		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "configmap", cmName, "--ignore-not-found") //nolint:errcheck
-		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", podName, "--ignore-not-found")      //nolint:errcheck
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", podName, "--ignore-not-found", "--wait=false") //nolint:errcheck
 	})
 
 	helpers.MustKubectlApply(t, helpers.SharedVCKubeconfig, fmt.Sprintf(`
@@ -158,13 +160,15 @@ spec:
   containers:
   - name: reader
     image: busybox:latest
-    command: ["sh", "-c", "echo $MESSAGE && sleep 5"]
-    env:
-    - name: MESSAGE
-      valueFrom:
-        configMapKeyRef:
-          name: %s
-          key: MESSAGE
+    command: ["sh", "-c", "cat /etc/cm/message && sleep 5"]
+    volumeMounts:
+    - name: cm
+      mountPath: /etc/cm
+      readOnly: true
+  volumes:
+  - name: cm
+    configMap:
+      name: %s
 `, podName, cmName))
 
 	helpers.MustWaitFor(t, 5*time.Minute, 5*time.Second, func() error {

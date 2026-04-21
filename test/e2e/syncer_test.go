@@ -22,7 +22,7 @@ func TestPodNameTranslation(t *testing.T) {
 	helpers.MustKubectl(t, helpers.SharedVCKubeconfig,
 		"run", podName, "--image=nginx:alpine", "--restart=Never")
 	t.Cleanup(func() {
-		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", podName, "--ignore-not-found") //nolint:errcheck
+		helpers.Kubectl(t, helpers.SharedVCKubeconfig, "delete", "pod", podName, "--ignore-not-found", "--wait=false") //nolint:errcheck
 	})
 
 	translated := helpers.SharedVCName + "-x-" + podName + "-x-default"
