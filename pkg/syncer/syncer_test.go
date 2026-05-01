@@ -11,7 +11,7 @@ import (
 )
 
 func TestHostName(t *testing.T) {
-	s := New("mycluster", nil, nil)
+	s := New("mycluster", nil, nil, nil, "")
 
 	tests := []struct {
 		name      string
@@ -32,7 +32,7 @@ func TestHostName(t *testing.T) {
 }
 
 func TestSyncLabels(t *testing.T) {
-	s := New("test", nil, nil)
+	s := New("test", nil, nil, nil, "")
 	labels := s.syncLabels("my-pod", "default")
 
 	if labels[LabelSyncedFrom] != "test" {
@@ -115,7 +115,7 @@ func TestIsSystemSecret(t *testing.T) {
 func TestSyncConfigMapToHost(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
-	s := New("test", hostClient, vClient)
+	s := New("test", hostClient, nil, vClient, "")
 	ctx := context.Background()
 
 	vCM := &corev1.ConfigMap{
@@ -158,7 +158,7 @@ func TestSyncConfigMapToHost(t *testing.T) {
 func TestSyncConfigMapToHost_Update(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
-	s := New("test", hostClient, vClient)
+	s := New("test", hostClient, nil, vClient, "")
 	ctx := context.Background()
 
 	vCM := &corev1.ConfigMap{
@@ -189,7 +189,7 @@ func TestSyncConfigMapToHost_Update(t *testing.T) {
 func TestSyncSecretToHost(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
-	s := New("test", hostClient, vClient)
+	s := New("test", hostClient, nil, vClient, "")
 	ctx := context.Background()
 
 	vSecret := &corev1.Secret{
@@ -228,7 +228,7 @@ func TestSyncSecretToHost(t *testing.T) {
 func TestSyncServiceToHost(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
-	s := New("test", hostClient, vClient)
+	s := New("test", hostClient, nil, vClient, "")
 	ctx := context.Background()
 
 	vSvc := &corev1.Service{
@@ -272,7 +272,7 @@ func TestSyncServiceToHost(t *testing.T) {
 func TestSyncServiceToHost_Update(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
-	s := New("test", hostClient, vClient)
+	s := New("test", hostClient, nil, vClient, "")
 	ctx := context.Background()
 
 	vSvc := &corev1.Service{
@@ -303,7 +303,7 @@ func TestSyncServiceToHost_Update(t *testing.T) {
 func TestSyncPodToHost(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
-	s := New("test", hostClient, vClient)
+	s := New("test", hostClient, nil, vClient, "")
 	ctx := context.Background()
 
 	vPod := &corev1.Pod{
@@ -359,7 +359,7 @@ func TestSyncPodToHost(t *testing.T) {
 func TestSyncPodToHost_FiltersSATokenVolumes(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
-	s := New("test", hostClient, vClient)
+	s := New("test", hostClient, nil, vClient, "")
 	ctx := context.Background()
 
 	vPod := &corev1.Pod{
@@ -403,7 +403,7 @@ func TestSyncPodToHost_FiltersSATokenVolumes(t *testing.T) {
 func TestSyncPodToHost_RewritesVolumeRefs(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
-	s := New("test", hostClient, vClient)
+	s := New("test", hostClient, nil, vClient, "")
 	ctx := context.Background()
 
 	vPod := &corev1.Pod{
@@ -458,7 +458,7 @@ func TestSyncPodToHost_RewritesVolumeRefs(t *testing.T) {
 func TestSyncNodeToVirtual(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
-	s := New("test", hostClient, vClient)
+	s := New("test", hostClient, nil, vClient, "")
 	ctx := context.Background()
 
 	hostNode := &corev1.Node{
@@ -503,7 +503,7 @@ func TestSyncNodeToVirtual_Update(t *testing.T) {
 			},
 		},
 	})
-	s := New("test", nil, vClient)
+	s := New("test", nil, nil, vClient, "")
 	ctx := context.Background()
 
 	hostNode := &corev1.Node{
@@ -536,7 +536,7 @@ func TestReconcileVirtualPodFromHost_BindsAndCopiesStatus(t *testing.T) {
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodPending},
 	})
-	s := New("test", nil, vClient)
+	s := New("test", nil, nil, vClient, "")
 	ctx := context.Background()
 
 	hostPod := &corev1.Pod{
@@ -588,7 +588,7 @@ func TestReconcileVirtualPodFromHost_BindsAndCopiesStatus(t *testing.T) {
 
 func TestReconcileVirtualPodFromHost_NoVirtualPod(t *testing.T) {
 	vClient := fake.NewSimpleClientset()
-	s := New("test", nil, vClient)
+	s := New("test", nil, nil, vClient, "")
 	ctx := context.Background()
 
 	hostPod := &corev1.Pod{
@@ -612,7 +612,7 @@ func TestReconcileVirtualPodFromHost_NoVirtualPod(t *testing.T) {
 
 func TestReconcileVirtualPodFromHost_NoLabels(t *testing.T) {
 	vClient := fake.NewSimpleClientset()
-	s := New("test", nil, vClient)
+	s := New("test", nil, nil, vClient, "")
 	ctx := context.Background()
 
 	hostPod := &corev1.Pod{
@@ -635,7 +635,7 @@ func TestReconcileVirtualPodFromHost_StatusOnlyUpdate(t *testing.T) {
 		Spec:       corev1.PodSpec{NodeName: "k3s01"},
 		Status:     corev1.PodStatus{Phase: corev1.PodPending},
 	})
-	s := New("test", nil, vClient)
+	s := New("test", nil, nil, vClient, "")
 	ctx := context.Background()
 
 	hostPod := &corev1.Pod{
@@ -665,7 +665,7 @@ func TestNew(t *testing.T) {
 	hostClient := fake.NewSimpleClientset()
 	vClient := fake.NewSimpleClientset()
 
-	s := New("myvc", hostClient, vClient)
+	s := New("myvc", hostClient, nil, vClient, "")
 
 	if s.name != "myvc" {
 		t.Errorf("name = %q, want myvc", s.name)

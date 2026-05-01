@@ -76,8 +76,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// POD_IP is injected via the downward API and used by the kubelet shim
+	// to override virtual node addresses so logs/exec/port-forward work.
+	podIP := os.Getenv("POD_IP")
+
 	// Start syncing
-	s := syncer.New(name, hostClient, vClient)
+	s := syncer.New(name, hostClient, hostConfig, vClient, podIP)
 	if err := s.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Syncer error: %v\n", err)
 		os.Exit(1)

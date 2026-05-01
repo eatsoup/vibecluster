@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -29,17 +30,24 @@ const (
 type Syncer struct {
 	name       string
 	hostClient kubernetes.Interface
+	hostConfig *rest.Config
 	vClient    kubernetes.Interface
 	hostNS     string
+	// podIP is the IP address of the syncer pod, used to override virtual
+	// node addresses so the virtual API server routes kubelet requests
+	// (logs/exec/port-forward) through our kubelet shim.
+	podIP string
 }
 
 // New creates a new Syncer.
-func New(name string, hostClient, vClient kubernetes.Interface) *Syncer {
+func New(name string, hostClient kubernetes.Interface, hostConfig *rest.Config, vClient kubernetes.Interface, podIP string) *Syncer {
 	return &Syncer{
 		name:       name,
 		hostClient: hostClient,
+		hostConfig: hostConfig,
 		vClient:    vClient,
 		hostNS:     k8s.NamespaceName(name),
+		podIP:      podIP,
 	}
 }
 
@@ -48,9 +56,12 @@ func (s *Syncer) Run(ctx context.Context) error {
 	fmt.Printf("Starting syncer for virtual cluster %q\n", s.name)
 	fmt.Printf("  Host namespace: %s\n", s.hostNS)
 	fmt.Printf("  Syncing: pods, services, configmaps, secrets\n")
+	if s.podIP != "" {
+		fmt.Printf("  Kubelet shim enabled (POD_IP=%s)\n", s.podIP)
+	}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 6)
+	errCh := make(chan error, 8)
 
 	syncFuncs := []struct {
 		name string
@@ -93,6 +104,19 @@ func (s *Syncer) Run(ctx context.Context) error {
 			errCh <- fmt.Errorf("host pods syncer: %w", err)
 		}
 	}()
+
+	// Start the kubelet shim so that kubectl logs/exec/port-forward
+	// requests are intercepted, name-translated, and proxied to the host API.
+	if s.podIP != "" && s.hostConfig != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			shim := NewKubeletShim(s.name, s.hostNS, s.hostConfig, s.hostClient)
+			if err := shim.Start(ctx); err != nil && ctx.Err() == nil {
+				errCh <- fmt.Errorf("kubelet shim: %w", err)
+			}
+		}()
+	}
 
 	wg.Wait()
 	close(errCh)
@@ -672,6 +696,12 @@ func (s *Syncer) syncNodeToVirtual(ctx context.Context, hostNode *corev1.Node) e
 		Status: hostNode.Status,
 	}
 
+	// Override node addresses so the virtual k3s API routes kubelet
+	// requests (logs/exec/port-forward) through our kubelet shim
+	// instead of directly to the host kubelet. This is what fixes
+	// the 502 from issue #21.
+	s.overrideNodeAddresses(vNode)
+
 	existing, err := s.vClient.CoreV1().Nodes().Get(ctx, hostNode.Name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		_, err = s.vClient.CoreV1().Nodes().Create(ctx, vNode, metav1.CreateOptions{})
@@ -685,9 +715,28 @@ func (s *Syncer) syncNodeToVirtual(ctx context.Context, hostNode *corev1.Node) e
 	}
 
 	existing.Status = hostNode.Status
+	s.overrideNodeAddresses(existing)
 	existing.Labels = hostNode.Labels
 	_, err = s.vClient.CoreV1().Nodes().UpdateStatus(ctx, existing, metav1.UpdateOptions{})
 	return err
+}
+
+// overrideNodeAddresses replaces the node's addresses with the syncer pod's
+// IP so the virtual k3s API server routes kubelet requests through the
+// kubelet shim. Also sets DaemonEndpoints.KubeletEndpoint.Port.
+func (s *Syncer) overrideNodeAddresses(node *corev1.Node) {
+	if s.podIP == "" {
+		return
+	}
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: s.podIP},
+		{Type: corev1.NodeHostName, Address: node.Name},
+	}
+	node.Status.DaemonEndpoints = corev1.NodeDaemonEndpoints{
+		KubeletEndpoint: corev1.DaemonEndpoint{
+			Port: int32(KubeletShimPort),
+		},
+	}
 }
 
 func boolPtr(b bool) *bool {
